@@ -1,9 +1,8 @@
 {
+  // Точка входа по умолчанию. На Deno Deploy достаточно иметь
+  // файл `mod.ts`, но deno.json помогает локально запускать бот
+  // командой `deno task dev`.
   "tasks": {
-    "dev": "deno run -A mod.ts"
-  },
-  "deploy": {
-    "project": "lalafo-tg-bishkek",
-    "entrypoint": "mod.ts"
+    "dev": "deno run --allow-net --allow-env mod.ts"
   }
 }

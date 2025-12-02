@@ -1,25 +1,43 @@
 /**
  * Lalafo → Telegram бот под Deno Deploy.
- * Долгосрочная аренда квартир в Бишкеке:
- *  - 1–2 комнаты
- *  - без лимита по цене (фильтр по цене отключён)
- *  - по возможности только от собственников
- * Отправка в Telegram с шапкой и всеми фотками, БЕЗ ссылки на Lalafo.
+ *
+ * Скрейпит объявления о долгосрочной аренде квартир в Бишкеке и
+ * отправляет новые объявления в Telegram. Настройки фильтрации читаются
+ * из переменных окружения. По умолчанию бот показывает только
+ * одно- и двухкомнатные квартиры, но цену не ограничивает и пытается
+ * отправить все найденные объявления.
+ *
+ * В сообщении используется развернутое обозначение комнат ("одна
+ * комната", "две комнаты"), полноценно выводится район и копируется
+ * описание объявления. Ссылка на Lalafo не добавляется.
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
 const CITY_SLUG = Deno.env.get("CITY_SLUG") ?? "bishkek";
-// MAX_PRICE_KGS пока не используем, оставлен на будущее
-const MAX_PRICE_KGS = Number(Deno.env.get("MAX_PRICE_KGS") ?? "60000");
+// Максимальная цена не применяется по умолчанию. Можно задать через
+// переменную окружения MAX_PRICE_KGS для ограничения объявлений.
+const MAX_PRICE_KGS = Deno.env.get("MAX_PRICE_KGS")
+  ? Number(Deno.env.get("MAX_PRICE_KGS"))
+  : null;
+// Список допустимых комнат. Строка вида "1,2" превращается в [1, 2].
 const ROOMS = (Deno.env.get("ROOMS") ?? "1,2")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean)
   .map((s) => Number(s));
-const OWNER_ONLY = (Deno.env.get("OWNER_ONLY") ?? "true") === "true";
-const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "20");
-const PAGES = Number(Deno.env.get("PAGES") ?? "2");
+// Если OWNER_ONLY=true, бот пропускает объявления от агентств.
+const OWNER_ONLY = (Deno.env.get("OWNER_ONLY") ?? "true").toLowerCase() ===
+  "true";
+// Ограничение количества объявлений за один проход. Можно увеличить,
+// например, до 50–100 для большего охвата.
+const ADS_LIMIT = Deno.env.get("ADS_LIMIT")
+  ? Number(Deno.env.get("ADS_LIMIT"))
+  : 50;
+// Количество страниц для скрейпа. Каждая страница обычно содержит ~24
+// объявлений. Увеличение числа страниц позволит ботy находить больше
+// объявлений.
+const PAGES = Deno.env.get("PAGES") ? Number(Deno.env.get("PAGES")) : 10;
 
 const BASE_URL = "https://lalafo.kg";
 
@@ -33,11 +51,14 @@ export interface Ad {
   is_owner: boolean | null;
   created_raw: string | null;
   images: string[];
+  description: string | null;
 }
 
+// Хранилище для запоминания уже отправленных объявлений. Deno KV
+// автоматически создается на стороне Deno Deploy.
 const kv = await Deno.openKv();
 
-/* ========= ВСПОМОГАТЕЛЬНЫЙ ПАРСИНГ HTML ========= */
+/* ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========= */
 
 function extractFirst(re: RegExp, text: string): string | null {
   const m = text.match(re);
@@ -59,11 +80,12 @@ async function fetchHtml(url: string): Promise<string> {
 }
 
 /**
- * Ссылки на объявления:
- * /bishkek/ads/...-id-123456789
+ * Ищет ссылки на объявления на странице выдачи.
+ * Ссылки имеют формат /bishkek/ads/...-id-123456789. Мы не
+ * полагаемся на кавычки вокруг ссылок, а вытаскиваем любой
+ * подходящий фрагмент пути.
  */
 function extractListingLinks(html: string, citySlug: string): string[] {
-  // Не завязываемся на кавычки, просто берём любой кусок пути
   const re = new RegExp(
     `(\\/${citySlug}\\/ads\\/[^"'<>\\s]+-id-\\d+)`,
     "g",
@@ -71,7 +93,6 @@ function extractListingLinks(html: string, citySlug: string): string[] {
   const seen = new Set<string>();
   const links: string[] = [];
   let m: RegExpExecArray | null;
-
   while ((m = re.exec(html)) !== null) {
     const href = new URL(m[1], BASE_URL).toString();
     if (!seen.has(href)) {
@@ -79,7 +100,6 @@ function extractListingLinks(html: string, citySlug: string): string[] {
       links.push(href);
     }
   }
-
   console.log("Extracted links:", links.length);
   return links;
 }
@@ -124,6 +144,9 @@ function parseTitle(html: string): string | null {
 }
 
 function parseLocation(html: string): string | null {
+  // Ищем участок после даты/времени и до слова "Позвонить". Это
+  // поле обычно содержит район и условия (например, "Восток-5 мкр,Без
+  // подселения,Собственник"). Если не найдено — возвращаем null.
   const re =
     /\d{2}\.\d{2}\.\d{4}\s*\/\s*\d{2}:\d{2}\s*([\s\S]+?)\s*Позвонить/i;
   const m = html.match(re);
@@ -133,7 +156,9 @@ function parseLocation(html: string): string | null {
 }
 
 function parseImages(html: string): string[] {
-  const re = /https:\/\/img\d+\.lalafo\.com\/[^\s"'<>]+/g;
+  // Ищем ссылку на изображение из блока posters. Если нужно больше
+  // фотографий, ограничиваемся 10.
+  const re = /https:\\/\\/img\d+\.lalafo\.com\\/[^\s"'<>]+/g;
   const seen = new Set<string>();
   const out: string[] = [];
   let m: RegExpExecArray | null;
@@ -148,12 +173,36 @@ function parseImages(html: string): string[] {
   return out;
 }
 
+/**
+ * Извлекает основное описание объявления. Сначала пытаемся найти
+ * контейнер с классом descriptionWrap, который содержит весь текст
+ * описания. Если не удаётся, пытаемся взять meta description.
+ */
+function parseDescription(html: string): string | null {
+  // Некоторые объявления хранят описание внутри descriptionWrap
+  let m = html.match(
+    /<div class="descriptionWrap[^>]*>([\s\S]*?)<\/div>/i,
+  );
+  if (m) {
+    const raw = m[1];
+    const text = stripTags(raw);
+    return text || null;
+  }
+  // Fallback: meta description
+  m = html.match(/<meta[^>]+name="description"[^>]+content="([^"]+)"/i);
+  if (m) {
+    const text = m[1];
+    return text || null;
+  }
+  return null;
+}
+
 async function fetchAd(url: string): Promise<Ad | null> {
   try {
     const html = await fetchHtml(url);
     const id =
-      extractFirst(/-id-(\d+)/, url) ??
-      new URL(url).pathname.split("/").pop() ??
+      extractFirst(/-id-(\d+)/, url) ||
+      new URL(url).pathname.split("/").pop() ||
       url;
     const title = parseTitle(html) ?? "Объявление на Lalafo";
     const price = parsePriceKgs(html);
@@ -162,7 +211,7 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const created = parseCreated(html);
     const location = parseLocation(html);
     const images = parseImages(html);
-
+    const description = parseDescription(html);
     return {
       id,
       url,
@@ -173,6 +222,7 @@ async function fetchAd(url: string): Promise<Ad | null> {
       created_raw: created,
       location,
       images,
+      description,
     };
   } catch (e) {
     console.log("fetchAd error", e);
@@ -183,7 +233,7 @@ async function fetchAd(url: string): Promise<Ad | null> {
 async function fetchAdsPage(
   page: number,
   opts: {
-    maxPriceKgs: number | null;     // сейчас не используется
+    maxPriceKgs: number | null;
     roomsAllowed: number[] | null;
     ownerOnly: boolean;
   },
@@ -196,21 +246,21 @@ async function fetchAdsPage(
   for (const link of links) {
     const ad = await fetchAd(link);
     if (!ad) continue;
-
-    if (opts.roomsAllowed && ad.rooms !== null &&
-      !opts.roomsAllowed.includes(ad.rooms)) {
+    if (
+      opts.roomsAllowed && ad.rooms !== null &&
+      !opts.roomsAllowed.includes(ad.rooms)
+    ) {
       continue;
     }
     if (opts.ownerOnly && ad.is_owner === false) {
       continue;
     }
-
-    // Фильтр по цене отключён:
-    // if (opts.maxPriceKgs !== null && ad.price_kgs !== null &&
-    //   ad.price_kgs > opts.maxPriceKgs) {
-    //   continue;
-    // }
-
+    if (
+      opts.maxPriceKgs !== null && ad.price_kgs !== null &&
+      ad.price_kgs > opts.maxPriceKgs
+    ) {
+      continue;
+    }
     ads.push(ad);
   }
   return ads;
@@ -220,7 +270,7 @@ async function fetchAds(): Promise<Ad[]> {
   const out: Ad[] = [];
   for (let page = 1; page <= PAGES; page++) {
     const pageAds = await fetchAdsPage(page, {
-      maxPriceKgs: MAX_PRICE_KGS || null,
+      maxPriceKgs: MAX_PRICE_KGS,
       roomsAllowed: ROOMS.length ? ROOMS : null,
       ownerOnly: OWNER_ONLY,
     });
@@ -228,12 +278,13 @@ async function fetchAds(): Promise<Ad[]> {
       out.push(ad);
       if (out.length >= ADS_LIMIT) return out;
     }
+    // небольшая пауза между страницами, чтобы не нагружать сервер
     await new Promise((r) => setTimeout(r, 1000));
   }
   return out;
 }
 
-/* ========= KV (сохранённые объявления) ========= */
+/* ========= KV ========= */
 
 async function hasSeen(id: string): Promise<boolean> {
   const res = await kv.get(["seen", id]);
@@ -270,33 +321,35 @@ async function tgSend(
   }
 }
 
+function roomsToWords(rooms: number | null): string {
+  if (rooms === 1) return "одна комната";
+  if (rooms === 2) return "две комнаты";
+  return "квартира";
+}
+
 function buildCaption(ad: Ad): string {
-  const roomsStr = ad.rooms ? `${ad.rooms}к` : "квартира";
+  const roomsWord = roomsToWords(ad.rooms);
+  const header = `🏠 <b>Аренда ${roomsWord} в Бишкеке</b>\n`;
   const priceStr = ad.price_kgs != null
     ? `${ad.price_kgs.toLocaleString("ru-RU")} KGS`
     : "Цена не указана";
-  const locStr = ad.location || "Бишкек";
-
-  const header = `🏠 <b>Аренда ${roomsStr} в Бишкеке</b>\n`;
   const priceLine = `💰 <b>${priceStr}</b>\n`;
+  // Используем распарсенный район, если он есть, иначе просто "Бишкек"
+  const locStr = ad.location || "Бишкек";
   const locLine = `📍 ${locStr}\n`;
-
   const meta: string[] = [];
   if (ad.is_owner === true) meta.push("от собственника");
   else if (ad.is_owner === false) meta.push("от агентства/риэлтора");
   if (ad.created_raw) meta.push(ad.created_raw);
   const metaLine = meta.length ? `ℹ️ ${meta.join(" • ")}\n` : "";
-
-  // ВАЖНО: никакой ссылки на Lalafo
-  // Можно потом сюда добавить описание, если начнём его парсить.
-
-  return header + priceLine + locLine + metaLine;
+  const description = ad.description ? `\n${ad.description}` : "";
+  return header + priceLine + locLine + metaLine + description;
 }
 
 async function sendAd(ad: Ad): Promise<void> {
   const caption = buildCaption(ad);
   const images = ad.images.slice(0, 10);
-
+  // Если нет изображений, отправляем как обычное сообщение
   if (!images.length) {
     await tgSend("sendMessage", {
       chat_id: CHAT_ID,
@@ -306,7 +359,7 @@ async function sendAd(ad: Ad): Promise<void> {
     });
     return;
   }
-
+  // Отправляем в виде медиагруппы: caption добавляем только к первой фотографии
   const media = images.map((url, idx) => {
     const obj: Record<string, unknown> = {
       type: "photo",
@@ -318,7 +371,6 @@ async function sendAd(ad: Ad): Promise<void> {
     }
     return obj;
   });
-
   await tgSend("sendMediaGroup", {
     chat_id: CHAT_ID,
     media,
@@ -331,17 +383,18 @@ async function runOnce(): Promise<void> {
   console.log("Run scrape...");
   const ads = await fetchAds();
   console.log(`Fetched ${ads.length} ads`);
-
   for (const ad of ads) {
     if (await hasSeen(ad.id)) continue;
     await sendAd(ad);
     await markSeen(ad.id);
+    // Пауза между отправками, чтобы не превысить лимиты Telegram
     await new Promise((r) => setTimeout(r, 1500));
   }
 }
 
-/* ========= Cron для Deno Deploy ========= */
+/* ========= Cron и HTTP-сервер ========= */
 
+// Автозапуск каждые пять минут на Deno Deploy
 Deno.cron("lalafo-bishkek-rent", "*/5 * * * *", async () => {
   try {
     await runOnce();
@@ -350,8 +403,7 @@ Deno.cron("lalafo-bishkek-rent", "*/5 * * * *", async () => {
   }
 });
 
-/* ========= HTTP-сервер ========= */
-
+// HTTP endpoint: GET /run выполняет проход сразу
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   if (url.pathname === "/run") {
