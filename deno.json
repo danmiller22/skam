@@ -1,0 +1,9 @@
+{
+  "tasks": {
+    "dev": "deno run -A mod.ts"
+  },
+  "deploy": {
+    "project": "lalafo-tg-bishkek",
+    "entrypoint": "mod.ts"
+  }
+}
