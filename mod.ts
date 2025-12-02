@@ -4,22 +4,22 @@
  * Скрейпит объявления о долгосрочной аренде квартир в Бишкеке
  * и отправляет новые объявления в Telegram.
  *
- * Формат сообщения:
+ * Пример формата:
  *
  * 🏠 Аренда две комнаты в Бишкеке
  * 💰 50 000 KGS
  * 📍 Бишкек, Тунгуч мкр
  * 🛏 Комнат: 2
  * 👤 Контакт: Baha
+ * 📞 Телефон: +996 XXX XXX XXX
  * ℹ️ от собственника • 16.11.2025 / 16:28
  *
- * <описание объявления>
+ * <описание объявления без ссылок и lalafo.kg>
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
 
-// по умолчанию: Бишкек, без фильтров по комнатам/собственнику
 const CITY_SLUG = Deno.env.get("CITY_SLUG") ?? "bishkek";
 const PAGES = Number(Deno.env.get("PAGES") ?? "3");
 const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "100");
@@ -38,11 +38,12 @@ export interface Ad {
   images: string[];
   description: string | null;
   owner_name: string | null;
+  phone: string | null;
 }
 
 const kv = await Deno.openKv();
 
-/* ================= ВСПОМОГАТЕЛЬНЫЙ ПАРСИНГ ================= */
+/* ================= УТИЛИТЫ ================= */
 
 function extractFirst(re: RegExp, text: string): string | null {
   const m = text.match(re);
@@ -63,10 +64,7 @@ async function fetchHtml(url: string): Promise<string> {
   return await res.text();
 }
 
-/**
- * Ссылки на объявления:
- * /bishkek/ads/...-id-123456789
- */
+/** Ссылки вида /bishkek/ads/...-id-12345678 */
 function extractListingLinks(html: string, citySlug: string): string[] {
   const re = new RegExp(`(\\/${citySlug}\\/ads\\/[^"'<>\\s]+-id-\\d+)`, "g");
   const seen = new Set<string>();
@@ -84,6 +82,12 @@ function extractListingLinks(html: string, citySlug: string): string[] {
   console.log("Extracted links:", links.length);
   return links;
 }
+
+function stripTags(s: string): string {
+  return s.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/* ============ ПАРСИНГ ПОЛЕЙ ОБЪЯВЛЕНИЯ ============ */
 
 function parsePriceKgs(html: string): number | null {
   const m = html.match(/([\d\s]{2,})\s*KGS/);
@@ -113,10 +117,6 @@ function parseCreated(html: string): string | null {
   return m ? m[1] : null;
 }
 
-function stripTags(s: string): string {
-  return s.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-}
-
 function parseTitle(html: string): string | null {
   const h1 = extractFirst(/<h1[^>]*>([\s\S]*?)<\/h1>/i, html);
   if (h1) return stripTags(h1);
@@ -124,8 +124,7 @@ function parseTitle(html: string): string | null {
   return t ? stripTags(t) : null;
 }
 
-function parseLocation(html: string): string | null {
-  // Попытка вытащить город/район из структурированных данных
+function parseLocationFromJson(html: string): string | null {
   const mCity = html.match(/"addressLocality"\s*:\s*"([^"]+)"/);
   const mStreet = html.match(/"streetAddress"\s*:\s*"([^"]+)"/);
   if (mCity || mStreet) {
@@ -133,14 +132,20 @@ function parseLocation(html: string): string | null {
     const combined = parts.join(", ");
     if (combined) return combined;
   }
+  return null;
+}
 
-  // Fallback — эвристика по дате и слову «Позвонить»
+function parseLocationFallback(html: string): string | null {
   const re =
     /\d{2}\.\d{2}\.\d{4}\s*\/\s*\d{2}:\d{2}\s*([\s\S]+?)\s*Позвонить/i;
   const m = html.match(re);
   if (!m) return null;
   const loc = m[1].replace(/\s+/g, " ").trim();
   return loc || null;
+}
+
+function parseLocation(html: string): string | null {
+  return parseLocationFromJson(html) ?? parseLocationFallback(html);
 }
 
 function parseImages(html: string): string[] {
@@ -159,15 +164,27 @@ function parseImages(html: string): string[] {
   return out;
 }
 
+function cleanDescription(raw: string): string {
+  let s = raw;
+
+  // убираем все ссылки
+  s = s.replace(/https?:\/\/\S+/gi, "");
+  s = s.replace(/lalafo\.kg/gi, "");
+
+  // убираем лишние квадратные скобки/мусор вида 【…】
+  s = s.replace(/【[^】]*】/g, " ");
+
+  s = s.replace(/\s{2,}/g, " ").trim();
+  return s;
+}
+
 function parseDescription(html: string): string | null {
-  // 1) блок описания
   const byDataTestId = extractFirst(
     /<div[^>]+data-testid="ad-description"[^>]*>([\s\S]*?)<\/div>/i,
     html,
   );
   let desc = byDataTestId;
 
-  // 2) itemprop=description
   if (!desc) {
     const pDesc = extractFirst(
       /<p[^>]*itemprop="description"[^>]*>([\s\S]*?)<\/p>/i,
@@ -176,7 +193,6 @@ function parseDescription(html: string): string | null {
     desc = pDesc;
   }
 
-  // 3) meta description
   if (!desc) {
     const meta = extractFirst(
       /<meta\s+name="description"\s+content="([\s\S]*?)"/i,
@@ -187,29 +203,25 @@ function parseDescription(html: string): string | null {
 
   if (!desc) return null;
 
-  const clean = stripTags(desc);
+  const clean = cleanDescription(stripTags(desc));
   if (!clean) return null;
 
-  // Чтобы не упираться в лимит telegram по caption/description
   return clean.slice(0, 1500);
 }
 
 function parseOwnerName(html: string): string | null {
-  // Попытка вытащить имя из JSON
   const m1 = html.match(/"sellerName"\s*:\s*"([^"]+)"/);
   if (m1 && m1[1]) return m1[1];
 
   const m2 = html.match(/"userName"\s*:\s*"([^"]+)"/);
   if (m2 && m2[1]) return m2[1];
 
-  // По data-testid
   const byTestId = extractFirst(
     /data-testid="seller-name"[^>]*>([\s\S]*?)<\/[^>]+>/i,
     html,
   );
   if (byTestId) return stripTags(byTestId);
 
-  // Общий fallback
   const byLabel = extractFirst(
     /Владелец[^<]*<\/[^>]+>\s*<[^>]*>([\s\S]*?)<\/[^>]+>/i,
     html,
@@ -218,6 +230,52 @@ function parseOwnerName(html: string): string | null {
 
   return null;
 }
+
+function parsePhoneFromText(text: string): string | null {
+  // ищем что-то похожее на телефон (КР: +996 / 0XXX / 0550 и т.п.)
+  const phoneRegex =
+    /(?:\+996[\s\-]?)?(?:0\d{2}|\d{3})[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2}/g;
+  const matches = text.match(phoneRegex);
+  if (!matches) return null;
+
+  for (const raw of matches) {
+    const digits = raw.replace(/\D/g, "");
+    if (digits.length >= 9) {
+      return raw.replace(/\s+/g, " ");
+    }
+  }
+  return null;
+}
+
+function enrichLocation(
+  rawLocation: string | null,
+  description: string | null,
+): string {
+  let loc = rawLocation || "";
+
+  if ((!loc || loc === "Бишкек") && description) {
+    const patterns: RegExp[] = [
+      /([А-ЯЁA-Z][^,\n]{0,30}\s+(?:мкр|микрорайон|ж\/м))/i,
+      /микрорайон\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
+      /район\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
+    ];
+    for (const re of patterns) {
+      const m = description.match(re);
+      if (m && m[1]) {
+        const area = m[1].trim();
+        return `Бишкек, ${area}`;
+      }
+    }
+  }
+
+  if (!loc) return "Бишкек";
+  if (!loc.toLowerCase().includes("бишкек")) {
+    return `Бишкек, ${loc}`;
+  }
+  return loc;
+}
+
+/* ============ ЗАГРУЗКА ОДНОГО ОБЪЯВЛЕНИЯ ============ */
 
 async function fetchAd(url: string): Promise<Ad | null> {
   try {
@@ -231,10 +289,13 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const rooms = parseRooms(html);
     const isOwner = parseIsOwner(html);
     const created = parseCreated(html);
-    const location = parseLocation(html);
-    const images = parseImages(html);
+    const rawLocation = parseLocation(html);
     const description = parseDescription(html);
+    const location = enrichLocation(rawLocation, description);
+    const images = parseImages(html);
     const ownerName = parseOwnerName(html);
+    const phone =
+      description ? parsePhoneFromText(description) : null;
 
     return {
       id,
@@ -248,12 +309,15 @@ async function fetchAd(url: string): Promise<Ad | null> {
       images,
       description,
       owner_name: ownerName,
+      phone,
     };
   } catch (e) {
     console.log("fetchAd error", e);
     return null;
   }
 }
+
+/* ============ ЗАГРУЗКА СПИСКА ОБЪЯВЛЕНИЙ ============ */
 
 async function fetchAdsPage(page: number): Promise<Ad[]> {
   const path =
@@ -264,7 +328,6 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
   for (const link of links) {
     const ad = await fetchAd(link);
     if (!ad) continue;
-
     ads.push(ad);
   }
   return ads;
@@ -283,7 +346,7 @@ async function fetchAds(): Promise<Ad[]> {
   return out;
 }
 
-/* ================= KV (seen ids) ================= */
+/* ============ KV (seen ids) ============ */
 
 async function hasSeen(id: string): Promise<boolean> {
   const res = await kv.get(["seen", id]);
@@ -294,7 +357,7 @@ async function markSeen(id: string): Promise<void> {
   await kv.set(["seen", id], true);
 }
 
-/* ================= TELEGRAM ================= */
+/* ============ TELEGRAM ============ */
 
 async function tgSend(
   method: string,
@@ -314,6 +377,11 @@ async function tgSend(
     }
   }
   const res = await fetch(url, { method: "POST", body: form });
+  if (res.status === 429) {
+    const txt = await res.text();
+    console.log("Telegram error 429", txt);
+    return;
+  }
   if (!res.ok) {
     const txt = await res.text();
     console.log("Telegram error", res.status, txt);
@@ -345,6 +413,10 @@ function buildCaption(ad: Ad): string {
     ? `👤 Контакт: ${ad.owner_name}\n`
     : "";
 
+  const phoneLine = ad.phone
+    ? `📞 Телефон: ${ad.phone}\n`
+    : "";
+
   const meta: string[] = [];
   if (ad.is_owner === true) meta.push("от собственника");
   else if (ad.is_owner === false) meta.push("от агентства/риэлтора");
@@ -356,9 +428,8 @@ function buildCaption(ad: Ad): string {
     descPart = `\n${ad.description}`;
   }
 
-  // НИКАКИХ ссылок на Lalafo — только шапка + описание
-  return header + priceLine + locLine + roomsLine + contactLine + metaLine +
-    descPart;
+  return header + priceLine + locLine + roomsLine +
+    contactLine + phoneLine + metaLine + descPart;
 }
 
 async function sendAd(ad: Ad): Promise<void> {
@@ -393,7 +464,7 @@ async function sendAd(ad: Ad): Promise<void> {
   });
 }
 
-/* ================= ОДИН ПРОХОД ================= */
+/* ============ ОДИН ПРОХОД ============ */
 
 async function runOnce(): Promise<void> {
   console.log("Run scrape...");
@@ -408,7 +479,7 @@ async function runOnce(): Promise<void> {
   }
 }
 
-/* ================= CRON + HTTP ================= */
+/* ============ CRON + HTTP ============ */
 
 Deno.cron("lalafo-bishkek-rent", "*/5 * * * *", async () => {
   try {
