@@ -1,34 +1,27 @@
 /**
  * Lalafo → Telegram бот под Deno Deploy.
  *
- * Скрейпит объявления о долгосрочной аренде квартир в Бишкеке и
- * отправляет новые объявления в Telegram.
+ * Скрейпит объявления о долгосрочной аренде квартир в Бишкеке
+ * и отправляет новые объявления в Telegram.
  *
  * Формат сообщения:
  *
  * 🏠 Аренда две комнаты в Бишкеке
  * 💰 50 000 KGS
- * 📍 Бишкек, полный район
- * ℹ️ от собственника
+ * 📍 Бишкек, Тунгуч мкр
+ * 🛏 Комнат: 2
+ * 👤 Контакт: Baha
+ * ℹ️ от собственника • 16.11.2025 / 16:28
+ *
  * <описание объявления>
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
 
-// by default — Бишкек, 1–2 комнаты, без лимита по цене
+// по умолчанию: Бишкек, без фильтров по комнатам/собственнику
 const CITY_SLUG = Deno.env.get("CITY_SLUG") ?? "bishkek";
-const ROOMS = (Deno.env.get("ROOMS") ?? "1,2")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean)
-  .map((s) => Number(s));
-const OWNER_ONLY = (Deno.env.get("OWNER_ONLY") ?? "true") === "true";
-
-// Сколько страниц списка смотреть
 const PAGES = Number(Deno.env.get("PAGES") ?? "3");
-
-// Сколько объявлений максимум за один проход (на всякий случай)
 const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "100");
 
 const BASE_URL = "https://lalafo.kg";
@@ -44,11 +37,12 @@ export interface Ad {
   created_raw: string | null;
   images: string[];
   description: string | null;
+  owner_name: string | null;
 }
 
 const kv = await Deno.openKv();
 
-/* ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ================= */
+/* ================= ВСПОМОГАТЕЛЬНЫЙ ПАРСИНГ ================= */
 
 function extractFirst(re: RegExp, text: string): string | null {
   const m = text.match(re);
@@ -131,7 +125,16 @@ function parseTitle(html: string): string | null {
 }
 
 function parseLocation(html: string): string | null {
-  // локация обычно рядом с датой и контактами, это эвристика
+  // Попытка вытащить город/район из структурированных данных
+  const mCity = html.match(/"addressLocality"\s*:\s*"([^"]+)"/);
+  const mStreet = html.match(/"streetAddress"\s*:\s*"([^"]+)"/);
+  if (mCity || mStreet) {
+    const parts = [mCity?.[1], mStreet?.[1]].filter(Boolean) as string[];
+    const combined = parts.join(", ");
+    if (combined) return combined;
+  }
+
+  // Fallback — эвристика по дате и слову «Позвонить»
   const re =
     /\d{2}\.\d{2}\.\d{4}\s*\/\s*\d{2}:\d{2}\s*([\s\S]+?)\s*Позвонить/i;
   const m = html.match(re);
@@ -157,13 +160,14 @@ function parseImages(html: string): string[] {
 }
 
 function parseDescription(html: string): string | null {
-  // Попытка вытащить блок описания — эвристика, может потребовать подправить под верстку Lalafo
+  // 1) блок описания
   const byDataTestId = extractFirst(
     /<div[^>]+data-testid="ad-description"[^>]*>([\s\S]*?)<\/div>/i,
     html,
   );
   let desc = byDataTestId;
 
+  // 2) itemprop=description
   if (!desc) {
     const pDesc = extractFirst(
       /<p[^>]*itemprop="description"[^>]*>([\s\S]*?)<\/p>/i,
@@ -172,6 +176,7 @@ function parseDescription(html: string): string | null {
     desc = pDesc;
   }
 
+  // 3) meta description
   if (!desc) {
     const meta = extractFirst(
       /<meta\s+name="description"\s+content="([\s\S]*?)"/i,
@@ -185,8 +190,33 @@ function parseDescription(html: string): string | null {
   const clean = stripTags(desc);
   if (!clean) return null;
 
-  // Чтобы не упираться в лимит Telegram по длине caption
-  return clean.slice(0, 1000);
+  // Чтобы не упираться в лимит telegram по caption/description
+  return clean.slice(0, 1500);
+}
+
+function parseOwnerName(html: string): string | null {
+  // Попытка вытащить имя из JSON
+  const m1 = html.match(/"sellerName"\s*:\s*"([^"]+)"/);
+  if (m1 && m1[1]) return m1[1];
+
+  const m2 = html.match(/"userName"\s*:\s*"([^"]+)"/);
+  if (m2 && m2[1]) return m2[1];
+
+  // По data-testid
+  const byTestId = extractFirst(
+    /data-testid="seller-name"[^>]*>([\s\S]*?)<\/[^>]+>/i,
+    html,
+  );
+  if (byTestId) return stripTags(byTestId);
+
+  // Общий fallback
+  const byLabel = extractFirst(
+    /Владелец[^<]*<\/[^>]+>\s*<[^>]*>([\s\S]*?)<\/[^>]+>/i,
+    html,
+  );
+  if (byLabel) return stripTags(byLabel);
+
+  return null;
 }
 
 async function fetchAd(url: string): Promise<Ad | null> {
@@ -204,6 +234,7 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const location = parseLocation(html);
     const images = parseImages(html);
     const description = parseDescription(html);
+    const ownerName = parseOwnerName(html);
 
     return {
       id,
@@ -216,6 +247,7 @@ async function fetchAd(url: string): Promise<Ad | null> {
       location,
       images,
       description,
+      owner_name: ownerName,
     };
   } catch (e) {
     console.log("fetchAd error", e);
@@ -223,13 +255,7 @@ async function fetchAd(url: string): Promise<Ad | null> {
   }
 }
 
-async function fetchAdsPage(
-  page: number,
-  opts: {
-    roomsAllowed: number[] | null;
-    ownerOnly: boolean;
-  },
-): Promise<Ad[]> {
+async function fetchAdsPage(page: number): Promise<Ad[]> {
   const path =
     `/${CITY_SLUG}/kvartiry/arenda-kvartir/dolgosrochnaya-arenda-kvartir?page=${page}`;
   const html = await fetchHtml(new URL(path, BASE_URL).toString());
@@ -239,14 +265,6 @@ async function fetchAdsPage(
     const ad = await fetchAd(link);
     if (!ad) continue;
 
-    if (opts.roomsAllowed && ad.rooms !== null &&
-      !opts.roomsAllowed.includes(ad.rooms)) {
-      continue;
-    }
-    if (opts.ownerOnly && ad.is_owner === false) {
-      continue;
-    }
-
     ads.push(ad);
   }
   return ads;
@@ -255,10 +273,7 @@ async function fetchAdsPage(
 async function fetchAds(): Promise<Ad[]> {
   const out: Ad[] = [];
   for (let page = 1; page <= PAGES; page++) {
-    const pageAds = await fetchAdsPage(page, {
-      roomsAllowed: ROOMS.length ? ROOMS : null,
-      ownerOnly: OWNER_ONLY,
-    });
+    const pageAds = await fetchAdsPage(page);
     for (const ad of pageAds) {
       out.push(ad);
       if (out.length >= ADS_LIMIT) return out;
@@ -323,6 +338,13 @@ function buildCaption(ad: Ad): string {
   const priceLine = `💰 <b>${priceStr}</b>\n`;
   const locLine = `📍 ${locStr}\n`;
 
+  const roomsLine =
+    ad.rooms != null ? `🛏 Комнат: ${ad.rooms}\n` : "";
+
+  const contactLine = ad.owner_name
+    ? `👤 Контакт: ${ad.owner_name}\n`
+    : "";
+
   const meta: string[] = [];
   if (ad.is_owner === true) meta.push("от собственника");
   else if (ad.is_owner === false) meta.push("от агентства/риэлтора");
@@ -335,7 +357,8 @@ function buildCaption(ad: Ad): string {
   }
 
   // НИКАКИХ ссылок на Lalafo — только шапка + описание
-  return header + priceLine + locLine + metaLine + descPart;
+  return header + priceLine + locLine + roomsLine + contactLine + metaLine +
+    descPart;
 }
 
 async function sendAd(ad: Ad): Promise<void> {
@@ -347,7 +370,7 @@ async function sendAd(ad: Ad): Promise<void> {
       chat_id: CHAT_ID,
       text: caption,
       parse_mode: "HTML",
-      disable_web_page_preview: false,
+      disable_web_page_preview: true,
     });
     return;
   }
