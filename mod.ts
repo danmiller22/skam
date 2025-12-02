@@ -1,7 +1,10 @@
 /**
  * Lalafo → Telegram бот под Deno Deploy.
- * Скрейпит долгосрочную аренду квартир в Бишкеке
- * и шлёт новые объявления в Telegram с шапкой и всеми фото.
+ * Долгосрочная аренда квартир в Бишкеке:
+ *  - 1–2 комнаты
+ *  - до 60 000 KGS
+ *  - по возможности только от собственников
+ * Отправка в Telegram с шапкой и всеми фотками.
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
@@ -54,11 +57,20 @@ async function fetchHtml(url: string): Promise<string> {
   return await res.text();
 }
 
+/**
+ * Ссылки на объявления:
+ * /bishkek/ads/...-id-123456789
+ */
 function extractListingLinks(html: string, citySlug: string): string[] {
-  const re = new RegExp(`"(/${citySlug}/ads/[^"<>]+-id-\d+)"`, "g");
+  // Не завязываемся на кавычки, просто берём любой кусок пути
+  const re = new RegExp(
+    `(\\/${citySlug}\\/ads\\/[^"'<>\\s]+-id-\\d+)`,
+    "g",
+  );
   const seen = new Set<string>();
   const links: string[] = [];
   let m: RegExpExecArray | null;
+
   while ((m = re.exec(html)) !== null) {
     const href = new URL(m[1], BASE_URL).toString();
     if (!seen.has(href)) {
@@ -66,6 +78,8 @@ function extractListingLinks(html: string, citySlug: string): string[] {
       links.push(href);
     }
   }
+
+  console.log("Extracted links:", links.length);
   return links;
 }
 
@@ -118,7 +132,7 @@ function parseLocation(html: string): string | null {
 }
 
 function parseImages(html: string): string[] {
-  const re = /https:\/\/img\d+\.lalafo\.com\/[^\"'>\s]+/g;
+  const re = /https:\/\/img\d+\.lalafo\.com\/[^\s"'<>]+/g;
   const seen = new Set<string>();
   const out: string[] = [];
   let m: RegExpExecArray | null;
