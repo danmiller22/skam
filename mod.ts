@@ -2,14 +2,15 @@
  * Lalafo → Telegram бот под Deno Deploy.
  * Долгосрочная аренда квартир в Бишкеке:
  *  - 1–2 комнаты
- *  - до 60 000 KGS
+ *  - без лимита по цене (фильтр по цене отключён)
  *  - по возможности только от собственников
- * Отправка в Telegram с шапкой и всеми фотками.
+ * Отправка в Telegram с шапкой и всеми фотками, БЕЗ ссылки на Lalafo.
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
 const CITY_SLUG = Deno.env.get("CITY_SLUG") ?? "bishkek";
+// MAX_PRICE_KGS пока не используем, оставлен на будущее
 const MAX_PRICE_KGS = Number(Deno.env.get("MAX_PRICE_KGS") ?? "60000");
 const ROOMS = (Deno.env.get("ROOMS") ?? "1,2")
   .split(",")
@@ -182,7 +183,7 @@ async function fetchAd(url: string): Promise<Ad | null> {
 async function fetchAdsPage(
   page: number,
   opts: {
-    maxPriceKgs: number | null;
+    maxPriceKgs: number | null;     // сейчас не используется
     roomsAllowed: number[] | null;
     ownerOnly: boolean;
   },
@@ -195,6 +196,7 @@ async function fetchAdsPage(
   for (const link of links) {
     const ad = await fetchAd(link);
     if (!ad) continue;
+
     if (opts.roomsAllowed && ad.rooms !== null &&
       !opts.roomsAllowed.includes(ad.rooms)) {
       continue;
@@ -202,10 +204,13 @@ async function fetchAdsPage(
     if (opts.ownerOnly && ad.is_owner === false) {
       continue;
     }
-    if (opts.maxPriceKgs !== null && ad.price_kgs !== null &&
-      ad.price_kgs > opts.maxPriceKgs) {
-      continue;
-    }
+
+    // Фильтр по цене отключён:
+    // if (opts.maxPriceKgs !== null && ad.price_kgs !== null &&
+    //   ad.price_kgs > opts.maxPriceKgs) {
+    //   continue;
+    // }
+
     ads.push(ad);
   }
   return ads;
@@ -282,10 +287,10 @@ function buildCaption(ad: Ad): string {
   if (ad.created_raw) meta.push(ad.created_raw);
   const metaLine = meta.length ? `ℹ️ ${meta.join(" • ")}\n` : "";
 
-  const linkLine =
-    `\n🔗 <a href="${ad.url}">Открыть объявление на Lalafo</a>`;
+  // ВАЖНО: никакой ссылки на Lalafo
+  // Можно потом сюда добавить описание, если начнём его парсить.
 
-  return header + priceLine + locLine + metaLine + linkLine;
+  return header + priceLine + locLine + metaLine;
 }
 
 async function sendAd(ad: Ad): Promise<void> {
