@@ -1,20 +1,23 @@
 /**
  * Lalafo → Telegram бот под Deno Deploy.
  *
- * Пример формата сообщения:
+ * Только:
+ *  - 1-комнатные
+ *  - до 50 000 KGS
+ *  - только от собственников
  *
- * 5 мкр
+ * Формат сообщения:
+ *
+ * Бишкек, 5 мкр
  *
  * Количество комнат: 1
  * Тип недвижимости: Квартира
  * Тип предложения: Собственник
  *
  * Цена: 42000 KGS
- * Контакт: Baha
- * Телефон: +996 505 506 590
+ * Контакт: Имя
+ * Телефон: +996 ...
  * Объявление от: 16.11.2025 / 16:28
- *
- * <описание объявления без ссылок и lalafo.kg>
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
@@ -22,7 +25,14 @@ const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
 
 const CITY_SLUG = Deno.env.get("CITY_SLUG") ?? "bishkek";
 const PAGES = Number(Deno.env.get("PAGES") ?? "3");
-const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "30"); // чтобы не ловить 429
+
+// фильтры по условию
+const MAX_PRICE = 50000;
+const ONLY_ROOMS = 1;
+const OWNER_ONLY = true;
+
+// лимит объявлений за один прогон, чтобы не ловить 429
+const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "20");
 
 const BASE_URL = "https://lalafo.kg";
 
@@ -147,13 +157,12 @@ function parseLocationFallback(html: string): string | null {
 function cleanDescription(raw: string): string {
   let s = raw;
 
-  // убираем все ссылки
+  // вырезаем ссылки и lalafo
   s = s.replace(/https?:\/\/\S+/gi, "");
   s = s.replace(/lalafo\.kg/gi, "");
   s = s.replace(/【[^】]*】/g, " ");
   s = s.replace(/ᐈ/g, " ");
 
-  // режем строки, выбрасываем те, где есть lalafo
   const parts = s.split(/[\r\n]+/);
   const filtered = parts.filter((p) => !/lalafo/i.test(p));
   s = filtered.join("\n");
@@ -216,19 +225,26 @@ function parseOwnerName(html: string): string | null {
 }
 
 function parsePhoneFromText(text: string): string | null {
-  // ищем реальные телефоны: +996... или 0XXX XX XX XX
+  // широкий поиск телефона: +996..., 0XXX..., просто 8–12 цифр
   const phoneRegex =
-    /(\+996[\s\-]?\d[\d\s\-]{7,}|0\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})/g;
+    /(\+?\d[\d \-]{7,15})/g;
   const matches = text.match(phoneRegex);
   if (!matches) return null;
 
+  // предпочитаем варианты с 996 или начинающиеся с 0
+  let candidate: string | null = null;
   for (const raw of matches) {
     const digits = raw.replace(/\D/g, "");
-    if (digits.length >= 9) {
+    if (digits.length < 8 || digits.length > 13) continue;
+
+    if (/996/.test(digits) || /^0/.test(digits)) {
       return raw.replace(/\s+/g, " ");
     }
+    if (!candidate) {
+      candidate = raw.replace(/\s+/g, " ");
+    }
   }
-  return null;
+  return candidate;
 }
 
 function enrichLocation(
@@ -238,14 +254,12 @@ function enrichLocation(
   let loc = rawLocation || "";
 
   if ((!loc || loc.toLowerCase() === "бишкек") && description) {
-    // 5 мкр / 7 мкр
     const mNumMkr = description.match(/(\d+\s*мкр)/i);
     if (mNumMkr && mNumMkr[1]) {
       const area = mNumMkr[1].trim();
       return `Бишкек, ${area}`;
     }
 
-    // Название + мкр
     const mNameMkr = description.match(
       /([А-ЯЁA-Z][^,\n]{0,30}\s+мкр)/i,
     );
@@ -334,7 +348,7 @@ function parseImages(html: string): string[] {
   return out;
 }
 
-/* ============ СПИСОК ОБЪЯВЛЕНИЙ ============ */
+/* ============ СПИСОК ОБЪЯВЛЕНИЙ С ФИЛЬТРАМИ ============ */
 
 async function fetchAdsPage(page: number): Promise<Ad[]> {
   const path =
@@ -345,6 +359,16 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
   for (const link of links) {
     const ad = await fetchAd(link);
     if (!ad) continue;
+
+    // фильтр: только 1-комнатные
+    if (ad.rooms !== ONLY_ROOMS) continue;
+
+    // фильтр: цена до 50 000
+    if (ad.price_kgs != null && ad.price_kgs > MAX_PRICE) continue;
+
+    // фильтр: только собственники
+    if (OWNER_ONLY && ad.is_owner !== true) continue;
+
     ads.push(ad);
   }
   return ads;
@@ -438,11 +462,7 @@ function buildCaption(ad: Ad): string {
     lines.push(`Объявление от: ${ad.created_raw}`);
   }
 
-  if (ad.description) {
-    lines.push("");
-    lines.push(ad.description);
-  }
-
+  // описание СНИЗУ УБРАНО — никаких хвостов с lalafo
   return lines.join("\n");
 }
 
