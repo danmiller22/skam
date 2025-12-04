@@ -1,20 +1,23 @@
 /**
  * Lalafo → Telegram бот под Deno Deploy.
  *
- * Пример формата сообщения:
+ * Фильтры:
+ *  - только 1-комнатные
+ *  - цена ≤ 50 000 KGS
+ *  - только от собственников
  *
- * 5 мкр
+ * Формат сообщения:
+ *
+ * Бишкек, 5 мкр
  *
  * Количество комнат: 1
  * Тип недвижимости: Квартира
  * Тип предложения: Собственник
  *
  * Цена: 42000 KGS
- * Контакт: Baha
- * Телефон: +996 505 506 590
+ * Контакт: Имя
+ * Телефон: +996 ...
  * Объявление от: 16.11.2025 / 16:28
- *
- * <описание объявления без ссылок и lalafo.kg>
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
@@ -22,7 +25,14 @@ const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
 
 const CITY_SLUG = Deno.env.get("CITY_SLUG") ?? "bishkek";
 const PAGES = Number(Deno.env.get("PAGES") ?? "3");
-const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "30"); // чтобы не ловить 429
+
+// фильтры
+const MAX_PRICE = 50000;
+const ONLY_ROOMS = 1;
+const OWNER_ONLY = true;
+
+// лимит объявлений за один прогон
+const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "15");
 
 const BASE_URL = "https://lalafo.kg";
 
@@ -105,10 +115,16 @@ function parseRooms(html: string): number | null {
 }
 
 function parseIsOwner(html: string): boolean | null {
-  const hasOwner = html.includes("Собственник");
-  const hasAgent = html.includes("Риэлтор") || html.includes("Агентств");
+  // Смотрим и в «шапку», и в описание
+  const hasOwner =
+    /Собственник/i.test(html) || /Хозяин/i.test(html);
+  const hasAgent =
+    /Риэлтор/i.test(html) ||
+    /Агентств[оа]/i.test(html) ||
+    /Агентство недвижимости/i.test(html);
+
   if (hasOwner && !hasAgent) return true;
-  if (hasAgent) return false;
+  if (hasAgent && !hasOwner) return false;
   return null;
 }
 
@@ -147,13 +163,11 @@ function parseLocationFallback(html: string): string | null {
 function cleanDescription(raw: string): string {
   let s = raw;
 
-  // убираем все ссылки
   s = s.replace(/https?:\/\/\S+/gi, "");
   s = s.replace(/lalafo\.kg/gi, "");
   s = s.replace(/【[^】]*】/g, " ");
   s = s.replace(/ᐈ/g, " ");
 
-  // режем строки, выбрасываем те, где есть lalafo
   const parts = s.split(/[\r\n]+/);
   const filtered = parts.filter((p) => !/lalafo/i.test(p));
   s = filtered.join("\n");
@@ -216,19 +230,23 @@ function parseOwnerName(html: string): string | null {
 }
 
 function parsePhoneFromText(text: string): string | null {
-  // ищем реальные телефоны: +996... или 0XXX XX XX XX
-  const phoneRegex =
-    /(\+996[\s\-]?\d[\d\s\-]{7,}|0\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})/g;
+  const phoneRegex = /(\+?\d[\d \-]{7,15})/g;
   const matches = text.match(phoneRegex);
   if (!matches) return null;
 
+  let candidate: string | null = null;
   for (const raw of matches) {
     const digits = raw.replace(/\D/g, "");
-    if (digits.length >= 9) {
+    if (digits.length < 8 || digits.length > 13) continue;
+
+    if (/996/.test(digits) || /^0/.test(digits)) {
       return raw.replace(/\s+/g, " ");
     }
+    if (!candidate) {
+      candidate = raw.replace(/\s+/g, " ");
+    }
   }
-  return null;
+  return candidate;
 }
 
 function enrichLocation(
@@ -238,14 +256,21 @@ function enrichLocation(
   let loc = rawLocation || "";
 
   if ((!loc || loc.toLowerCase() === "бишкек") && description) {
-    // 5 мкр / 7 мкр
+    // 5 мкр, 7 мкр
     const mNumMkr = description.match(/(\d+\s*мкр)/i);
     if (mNumMkr && mNumMkr[1]) {
       const area = mNumMkr[1].trim();
       return `Бишкек, ${area}`;
     }
 
-    // Название + мкр
+    // ЖК <название>
+    const mJk = description.match(/ЖК\s+([А-ЯЁA-Z0-9][^,.\n]+)/i);
+    if (mJk && mJk[1]) {
+      const area = `ЖК ${mJk[1].trim()}`;
+      return `Бишкек, ${area}`;
+    }
+
+    // <название> мкр
     const mNameMkr = description.match(
       /([А-ЯЁA-Z][^,\n]{0,30}\s+мкр)/i,
     );
@@ -257,19 +282,23 @@ function enrichLocation(
     const patterns: RegExp[] = [
       /микрорайон\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
       /район\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
+      /Рабочий Городок/i,
     ];
     for (const re of patterns) {
       const m = description.match(re);
-      if (m && m[1]) {
-        const area = m[1].trim();
+      if (m && m[0]) {
+        const area = m[0].trim();
         return `Бишкек, ${area}`;
       }
     }
   }
 
-  if (!loc) return "Бишкек";
+  if (!loc) return "Бишкек, район не указан";
   if (!loc.toLowerCase().includes("бишкек")) {
     return `Бишкек, ${loc}`;
+  }
+  if (!/,/.test(loc)) {
+    return `${loc}, район не указан`;
   }
   return loc;
 }
@@ -334,7 +363,7 @@ function parseImages(html: string): string[] {
   return out;
 }
 
-/* ============ СПИСОК ОБЪЯВЛЕНИЙ ============ */
+/* ============ СПИСОК ОБЪЯВЛЕНИЙ С ФИЛЬТРАМИ ============ */
 
 async function fetchAdsPage(page: number): Promise<Ad[]> {
   const path =
@@ -345,6 +374,16 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
   for (const link of links) {
     const ad = await fetchAd(link);
     if (!ad) continue;
+
+    // только 1-комнатные
+    if (ad.rooms !== ONLY_ROOMS) continue;
+
+    // цена до 50 000
+    if (ad.price_kgs != null && ad.price_kgs > MAX_PRICE) continue;
+
+    // только собственники
+    if (OWNER_ONLY && ad.is_owner !== true) continue;
+
     ads.push(ad);
   }
   return ads;
@@ -379,10 +418,10 @@ async function markSeen(id: string): Promise<void> {
 async function tgSend(
   method: string,
   payload: Record<string, unknown>,
-): Promise<void> {
+): Promise<boolean> {
   if (!BOT_TOKEN || !CHAT_ID) {
     console.log("TELEGRAM_BOT_TOKEN/CHAT_ID not set, skip send");
-    return;
+    return false;
   }
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
   const form = new FormData();
@@ -394,19 +433,33 @@ async function tgSend(
     }
   }
   const res = await fetch(url, { method: "POST", body: form });
+  const txt = await res.text();
+
   if (res.status === 429) {
-    const txt = await res.text();
     console.log("Telegram error 429", txt);
-    return;
+    try {
+      const data = JSON.parse(txt);
+      const retry =
+        data.parameters?.retry_after ?? data.retry_after;
+      if (typeof retry === "number" && retry > 0 && retry < 60) {
+        await new Promise((r) => setTimeout(r, retry * 1000));
+      }
+    } catch {
+      // ignore
+    }
+    return false;
   }
+
   if (!res.ok) {
-    const txt = await res.text();
     console.log("Telegram error", res.status, txt);
+    return false;
   }
+
+  return true;
 }
 
 function buildCaption(ad: Ad): string {
-  const locStr = ad.location || "Бишкек";
+  const locStr = ad.location || "Бишкек, район не указан";
   const priceStr = ad.price_kgs != null
     ? `${ad.price_kgs.toLocaleString("ru-RU")} KGS`
     : "Цена не указана";
@@ -418,12 +471,7 @@ function buildCaption(ad: Ad): string {
   lines.push("");
   lines.push(`Количество комнат: ${roomsStr}`);
   lines.push("Тип недвижимости: Квартира");
-
-  if (ad.is_owner === true) {
-    lines.push("Тип предложения: Собственник");
-  } else if (ad.is_owner === false) {
-    lines.push("Тип предложения: Агентство/риэлтор");
-  }
+  lines.push("Тип предложения: Собственник"); // т.к. мы уже отфильтровали
 
   lines.push("");
   lines.push(`Цена: ${priceStr}`);
@@ -431,33 +479,28 @@ function buildCaption(ad: Ad): string {
   if (ad.owner_name) {
     lines.push(`Контакт: ${ad.owner_name}`);
   }
-  if (ad.phone) {
-    lines.push(`Телефон: ${ad.phone}`);
-  }
+  lines.push(`Телефон: ${ad.phone ?? "не указан"}`);
+
   if (ad.created_raw) {
     lines.push(`Объявление от: ${ad.created_raw}`);
   }
 
-  if (ad.description) {
-    lines.push("");
-    lines.push(ad.description);
-  }
-
+  // ВНИЗУ НИЧЕГО — описание НЕ добавляем, чтобы не было мусора
   return lines.join("\n");
 }
 
-async function sendAd(ad: Ad): Promise<void> {
+async function sendAd(ad: Ad): Promise<boolean> {
   const caption = buildCaption(ad);
   const images = ad.images.slice(0, 10);
 
   if (!images.length) {
-    await tgSend("sendMessage", {
+    const ok = await tgSend("sendMessage", {
       chat_id: CHAT_ID,
       text: caption,
       parse_mode: "HTML",
       disable_web_page_preview: true,
     });
-    return;
+    return ok;
   }
 
   const media = images.map((url, idx) => {
@@ -472,10 +515,11 @@ async function sendAd(ad: Ad): Promise<void> {
     return obj;
   });
 
-  await tgSend("sendMediaGroup", {
+  const ok = await tgSend("sendMediaGroup", {
     chat_id: CHAT_ID,
     media,
   });
+  return ok;
 }
 
 /* ============ ОДИН ПРОХОД ============ */
@@ -487,8 +531,12 @@ async function runOnce(): Promise<void> {
 
   for (const ad of ads) {
     if (await hasSeen(ad.id)) continue;
-    await sendAd(ad);
-    await markSeen(ad.id);
+
+    const sent = await sendAd(ad);
+    if (sent) {
+      await markSeen(ad.id);
+    }
+
     await new Promise((r) => setTimeout(r, 1500));
   }
 }
