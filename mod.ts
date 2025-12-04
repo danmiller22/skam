@@ -1,23 +1,31 @@
 /**
  * Lalafo → Telegram бот под Deno Deploy.
  *
- * Фильтры:
- *  - только 1-комнатные
+ * Условия:
+ *  - город: только Бишкек
+ *  - 1–2 комнаты
  *  - цена ≤ 50 000 KGS
- *  - только от собственников (отбрасываем только явно найденные агентства/риэлторов)
+ *  - только собственники (отсекаем явные агентства/риэлторов)
+ *  - обязательно есть номер телефона
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
 
-const CITY_SLUG = Deno.env.get("CITY_SLUG") ?? "bishkek";
-const PAGES = Number(Deno.env.get("PAGES") ?? "3");
+// Жёстко фиксируем Бишкек
+const CITY_SLUG = "bishkek";
 
+// фильтры
 const MAX_PRICE = 50000;
-const ONLY_ROOMS = 1;
+const MIN_ROOMS = 1;
+const MAX_ROOMS = 2;
 const OWNER_ONLY = true;
 
-const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "15");
+// лимит объявлений за один прогон
+const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "40");
+
+// сколько страниц списка обходим
+const PAGES = Number(Deno.env.get("PAGES") ?? "6");
 
 const BASE_URL = "https://lalafo.kg";
 
@@ -353,17 +361,17 @@ function parseImages(html: string): string[] {
 
 /* ================= ЛОГИКА ФИЛЬТРОВ ================= */
 
-function isOneRoomAd(ad: Ad): boolean {
+function isRoomsAllowed(ad: Ad): boolean {
   if (ad.rooms != null) {
-    return ad.rooms === ONLY_ROOMS;
+    return ad.rooms >= MIN_ROOMS && ad.rooms <= MAX_ROOMS;
   }
 
   const text = `${ad.title ?? ""} ${ad.description ?? ""}`.toLowerCase();
 
   if (
-    /\b[2-9]\s*комн/.test(text) ||
-    /\b[2-9][-\s]*комнатн/.test(text) ||
-    /двухкомнатн|трехкомнатн|четырехкомнатн|2к\b|2-к\b|3к\b|3-к\b/i.test(text)
+    /\b[3-9]\s*комн/.test(text) ||
+    /\b[3-9][-\s]*комнатн/.test(text) ||
+    /трехкомнатн|трёхкомнатн|четырехкомнатн|4к\b|4-к\b|3к\b|3-к\b/i.test(text)
   ) {
     return false;
   }
@@ -372,6 +380,14 @@ function isOneRoomAd(ad: Ad): boolean {
     /\b1\s*комн/.test(text) ||
     /\b1[-\s]*комнатн/i.test(text) ||
     /однокомнатн|1к\b|1-к\b|одна комната/i.test(text)
+  ) {
+    return true;
+  }
+
+  if (
+    /\b2\s*комн/.test(text) ||
+    /\b2[-\s]*комнатн/i.test(text) ||
+    /двухкомнатн|2к\b|2-к\b|две комнаты/i.test(text)
   ) {
     return true;
   }
@@ -391,14 +407,17 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
     const ad = await fetchAd(link);
     if (!ad) continue;
 
-    // только 1-комнатные (с расширенной проверкой)
-    if (!isOneRoomAd(ad)) continue;
+    // 1–2 комнаты
+    if (!isRoomsAllowed(ad)) continue;
 
-    // цена строго до 50 000 и должна быть распознана
+    // цена: обязательно и ≤ MAX_PRICE
     if (ad.price_kgs == null || ad.price_kgs > MAX_PRICE) continue;
 
-    // только собственники: отбрасываем только явных агентств/риэлторов
+    // только собственники: отбрасываем только явные агентства/риэлторов
     if (OWNER_ONLY && ad.is_owner === false) continue;
+
+    // обязателен номер телефона
+    if (!ad.phone) continue;
 
     ads.push(ad);
   }
@@ -421,12 +440,12 @@ async function fetchAds(): Promise<Ad[]> {
 /* ================= KV ================= */
 
 async function hasSeen(id: string): Promise<boolean> {
-  const res = await kv.get(["seen", id]);
+  const res = await kv.get(["seen_v3", id]);
   return Boolean(res.value);
 }
 
 async function markSeen(id: string): Promise<void> {
-  await kv.set(["seen", id], true);
+  await kv.set(["seen_v3", id], true);
 }
 
 /* ================= TELEGRAM ================= */
@@ -479,7 +498,8 @@ function buildCaption(ad: Ad): string {
   const priceStr = ad.price_kgs != null
     ? `${ad.price_kgs.toLocaleString("ru-RU")} KGS`
     : "Цена не указана";
-  const roomsStr = ad.rooms != null ? String(ad.rooms) : "1";
+  const roomsStr =
+    ad.rooms != null ? String(ad.rooms) : "—";
 
   const lines: string[] = [];
 
@@ -498,7 +518,7 @@ function buildCaption(ad: Ad): string {
     lines.push(`Объявление от: ${ad.created_raw}`);
   }
 
-  // без описания снизу — только шапка
+  // без описания снизу
   return lines.join("\n");
 }
 
