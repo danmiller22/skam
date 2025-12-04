@@ -4,20 +4,7 @@
  * Фильтры:
  *  - только 1-комнатные
  *  - цена ≤ 50 000 KGS
- *  - только от собственников
- *
- * Формат сообщения:
- *
- * Бишкек, 5 мкр
- *
- * Количество комнат: 1
- * Тип недвижимости: Квартира
- * Тип предложения: Собственник
- *
- * Цена: 42000 KGS
- * Контакт: Имя
- * Телефон: +996 ...
- * Объявление от: 16.11.2025 / 16:28
+ *  - только от собственников (отбрасываем только явно найденные агентства/риэлторов)
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
@@ -26,12 +13,10 @@ const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
 const CITY_SLUG = Deno.env.get("CITY_SLUG") ?? "bishkek";
 const PAGES = Number(Deno.env.get("PAGES") ?? "3");
 
-// фильтры
 const MAX_PRICE = 50000;
 const ONLY_ROOMS = 1;
 const OWNER_ONLY = true;
 
-// лимит объявлений за один прогон
 const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "15");
 
 const BASE_URL = "https://lalafo.kg";
@@ -53,7 +38,7 @@ export interface Ad {
 
 const kv = await Deno.openKv();
 
-/* ================= УТИЛИТЫ ================= */
+/* ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ================= */
 
 function extractFirst(re: RegExp, text: string): string | null {
   const m = text.match(re);
@@ -74,7 +59,6 @@ async function fetchHtml(url: string): Promise<string> {
   return await res.text();
 }
 
-/** Ссылки вида /bishkek/ads/...-id-12345678 */
 function extractListingLinks(html: string, citySlug: string): string[] {
   const re = new RegExp(`(\\/${citySlug}\\/ads\\/[^"'<>\\s]+-id-\\d+)`, "g");
   const seen = new Set<string>();
@@ -97,7 +81,7 @@ function stripTags(s: string): string {
   return s.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
-/* ============ ПАРСИНГ ПОЛЕЙ ОБЪЯВЛЕНИЯ ============ */
+/* ================= ПАРСИНГ ПОЛЕЙ ================= */
 
 function parsePriceKgs(html: string): number | null {
   const m = html.match(/([\d\s]{2,})\s*KGS/);
@@ -108,14 +92,23 @@ function parsePriceKgs(html: string): number | null {
 }
 
 function parseRooms(html: string): number | null {
-  const m = html.match(/(\d)\s+комнат[аы]/i);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? n : null;
+  const patterns = [
+    /(\d+)\s*комнат[аы]?\b/i,
+    /(\d+)[-\s]*комнатн/i,
+    /(\d+)\s*комн[.\s,]/i,
+    /(\d+)\s*к\b/i,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m && m[1]) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
 }
 
 function parseIsOwner(html: string): boolean | null {
-  // Смотрим и в «шапку», и в описание
   const hasOwner =
     /Собственник/i.test(html) || /Хозяин/i.test(html);
   const hasAgent =
@@ -256,21 +249,18 @@ function enrichLocation(
   let loc = rawLocation || "";
 
   if ((!loc || loc.toLowerCase() === "бишкек") && description) {
-    // 5 мкр, 7 мкр
     const mNumMkr = description.match(/(\d+\s*мкр)/i);
     if (mNumMkr && mNumMkr[1]) {
       const area = mNumMkr[1].trim();
       return `Бишкек, ${area}`;
     }
 
-    // ЖК <название>
     const mJk = description.match(/ЖК\s+([А-ЯЁA-Z0-9][^,.\n]+)/i);
     if (mJk && mJk[1]) {
       const area = `ЖК ${mJk[1].trim()}`;
       return `Бишкек, ${area}`;
     }
 
-    // <название> мкр
     const mNameMkr = description.match(
       /([А-ЯЁA-Z][^,\n]{0,30}\s+мкр)/i,
     );
@@ -303,7 +293,7 @@ function enrichLocation(
   return loc;
 }
 
-/* ============ ОДНО ОБЪЯВЛЕНИЕ ============ */
+/* ================= ОДНО ОБЪЯВЛЕНИЕ ================= */
 
 async function fetchAd(url: string): Promise<Ad | null> {
   try {
@@ -345,8 +335,6 @@ async function fetchAd(url: string): Promise<Ad | null> {
   }
 }
 
-/* картинки объявления */
-
 function parseImages(html: string): string[] {
   const re = /https:\/\/img\d+\.lalafo\.com\/[^\s"'<>]+/g;
   const seen = new Set<string>();
@@ -363,7 +351,35 @@ function parseImages(html: string): string[] {
   return out;
 }
 
-/* ============ СПИСОК ОБЪЯВЛЕНИЙ С ФИЛЬТРАМИ ============ */
+/* ================= ЛОГИКА ФИЛЬТРОВ ================= */
+
+function isOneRoomAd(ad: Ad): boolean {
+  if (ad.rooms != null) {
+    return ad.rooms === ONLY_ROOMS;
+  }
+
+  const text = `${ad.title ?? ""} ${ad.description ?? ""}`.toLowerCase();
+
+  if (
+    /\b[2-9]\s*комн/.test(text) ||
+    /\b[2-9][-\s]*комнатн/.test(text) ||
+    /двухкомнатн|трехкомнатн|четырехкомнатн|2к\b|2-к\b|3к\b|3-к\b/i.test(text)
+  ) {
+    return false;
+  }
+
+  if (
+    /\b1\s*комн/.test(text) ||
+    /\b1[-\s]*комнатн/i.test(text) ||
+    /однокомнатн|1к\b|1-к\b|одна комната/i.test(text)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/* ================= СПИСОК ОБЪЯВЛЕНИЙ ================= */
 
 async function fetchAdsPage(page: number): Promise<Ad[]> {
   const path =
@@ -375,14 +391,14 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
     const ad = await fetchAd(link);
     if (!ad) continue;
 
-    // только 1-комнатные
-    if (ad.rooms !== ONLY_ROOMS) continue;
+    // только 1-комнатные (с расширенной проверкой)
+    if (!isOneRoomAd(ad)) continue;
 
-    // цена до 50 000
-    if (ad.price_kgs != null && ad.price_kgs > MAX_PRICE) continue;
+    // цена строго до 50 000 и должна быть распознана
+    if (ad.price_kgs == null || ad.price_kgs > MAX_PRICE) continue;
 
-    // только собственники
-    if (OWNER_ONLY && ad.is_owner !== true) continue;
+    // только собственники: отбрасываем только явных агентств/риэлторов
+    if (OWNER_ONLY && ad.is_owner === false) continue;
 
     ads.push(ad);
   }
@@ -402,7 +418,7 @@ async function fetchAds(): Promise<Ad[]> {
   return out;
 }
 
-/* ============ KV (seen ids) ============ */
+/* ================= KV ================= */
 
 async function hasSeen(id: string): Promise<boolean> {
   const res = await kv.get(["seen", id]);
@@ -413,7 +429,7 @@ async function markSeen(id: string): Promise<void> {
   await kv.set(["seen", id], true);
 }
 
-/* ============ TELEGRAM ============ */
+/* ================= TELEGRAM ================= */
 
 async function tgSend(
   method: string,
@@ -463,7 +479,7 @@ function buildCaption(ad: Ad): string {
   const priceStr = ad.price_kgs != null
     ? `${ad.price_kgs.toLocaleString("ru-RU")} KGS`
     : "Цена не указана";
-  const roomsStr = ad.rooms != null ? String(ad.rooms) : "—";
+  const roomsStr = ad.rooms != null ? String(ad.rooms) : "1";
 
   const lines: string[] = [];
 
@@ -471,21 +487,18 @@ function buildCaption(ad: Ad): string {
   lines.push("");
   lines.push(`Количество комнат: ${roomsStr}`);
   lines.push("Тип недвижимости: Квартира");
-  lines.push("Тип предложения: Собственник"); // т.к. мы уже отфильтровали
-
+  lines.push("Тип предложения: Собственник");
   lines.push("");
   lines.push(`Цена: ${priceStr}`);
-
   if (ad.owner_name) {
     lines.push(`Контакт: ${ad.owner_name}`);
   }
   lines.push(`Телефон: ${ad.phone ?? "не указан"}`);
-
   if (ad.created_raw) {
     lines.push(`Объявление от: ${ad.created_raw}`);
   }
 
-  // ВНИЗУ НИЧЕГО — описание НЕ добавляем, чтобы не было мусора
+  // без описания снизу — только шапка
   return lines.join("\n");
 }
 
@@ -522,7 +535,7 @@ async function sendAd(ad: Ad): Promise<boolean> {
   return ok;
 }
 
-/* ============ ОДИН ПРОХОД ============ */
+/* ================= ОДИН ПРОХОД ================= */
 
 async function runOnce(): Promise<void> {
   console.log("Run scrape...");
@@ -541,7 +554,7 @@ async function runOnce(): Promise<void> {
   }
 }
 
-/* ============ CRON + HTTP ============ */
+/* ================= CRON + HTTP ================= */
 
 Deno.cron("lalafo-bishkek-rent", "*/5 * * * *", async () => {
   try {
