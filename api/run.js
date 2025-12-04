@@ -1,16 +1,20 @@
-
 // api/run.js
 // Lalafo → Telegram bot for Vercel (Node.js serverless function)
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
+// базовые фильтры
 const CITY_SLUG = "bishkek";
 const MAX_PRICE = 50000;
 const MIN_ROOMS = 1;
 const MAX_ROOMS = 2;
-const OWNER_ONLY = true;
 
+// доля объявлений от риелторов, которые пропускаем (0–1)
+// можно переопределить через env REALTOR_SHARE, например 0.3
+const REALTOR_SHARE = Number(process.env.REALTOR_SHARE || "0.25");
+
+// лимиты
 const ADS_LIMIT = Number(process.env.ADS_LIMIT || "30");
 const PAGES = Number(process.env.PAGES || "3");
 
@@ -106,6 +110,7 @@ function parseIsOwner(html) {
     /Собственник/i.test(html) || /Хозяин/i.test(html);
   const hasAgent =
     /Риэлтор/i.test(html) ||
+    /Риелтор/i.test(html) ||
     /Агентств[оа]/i.test(html) ||
     /Агентство недвижимости/i.test(html);
 
@@ -128,6 +133,7 @@ function parseTitle(html) {
 
 function cleanDescription(raw) {
   let s = raw;
+  // убрать ссылки и мусор
   s = s.replace(/https?:\/\/\S+/gi, "");
   s = s.replace(/lalafo\.kg/gi, "");
   s = s.replace(/【[^】]*】/g, " ");
@@ -329,6 +335,7 @@ function genericAreaFromDescription(description) {
 }
 
 function parsePhoneFromText(text) {
+  // явный «Телефон:»
   const explicit = text.match(/Телефон[:\s]*([0-9+()\-\s]{7,20})/i);
   if (explicit && explicit[1]) {
     const candidate = explicit[1].trim();
@@ -507,7 +514,14 @@ async function fetchAdsPage(page) {
 
     if (!isRoomsAllowed(ad)) continue;
     if (ad.price_kgs == null || ad.price_kgs > MAX_PRICE) continue;
-    if (OWNER_ONLY && ad.is_owner === false) continue;
+
+    // Немного риелторов: если явно риелтор, пропускаем только часть
+    if (ad.is_owner === false) {
+      const share =
+        REALTOR_SHARE > 0 && REALTOR_SHARE <= 1 ? REALTOR_SHARE : 0.25;
+      if (Math.random() > share) continue;
+    }
+
     if (!phoneDigitsValid(ad.phone)) continue;
 
     ads.push(ad);
@@ -524,6 +538,7 @@ async function fetchAds() {
       out.push(ad);
       if (out.length >= ADS_LIMIT) return out;
     }
+    // задержка между страницами, чтобы не душить Lalafo
     await new Promise((r) => setTimeout(r, 5000));
   }
   return out;
@@ -603,6 +618,7 @@ function buildCaption(ad) {
   lines.push("");
   lines.push(`Количество комнат: ${roomsStr}`);
   lines.push("Тип недвижимости: Квартира");
+  // всегда пишем «Собственник» в ТГ, даже если объявление от риелтора
   lines.push("Тип предложения: Собственник");
   lines.push("");
   lines.push(`Цена: ${priceStr}`);
