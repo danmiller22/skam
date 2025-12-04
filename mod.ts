@@ -237,24 +237,35 @@ function parseOwnerName(html: string): string | null {
   return null;
 }
 
+/**
+ * Парсим телефон:
+ *  - ищем последовательности вида +996 700 744 274 или 0700 744 274 и т.п.
+ *  - берём только то, что похоже на киргизский номер:
+ *      * 12 цифр и начинается с 9967 (мобильный)
+ *      * 10 цифр и начинается с 0
+ *  - короткие id (8 цифр и т.п.) отсекаем.
+ */
 function parsePhoneFromText(text: string): string | null {
-  const phoneRegex = /(\+?\d[\d \-]{7,15})/g;
-  const matches = text.match(phoneRegex);
-  if (!matches) return null;
+  const phoneRegex = /(\+?\d[\d \-\(\)]{7,20})/g;
+  let match: RegExpExecArray | null;
 
-  let candidate: string | null = null;
-  for (const raw of matches) {
+  while ((match = phoneRegex.exec(text)) !== null) {
+    const raw = match[1];
     const digits = raw.replace(/\D/g, "");
-    if (digits.length < 8 || digits.length > 13) continue;
 
-    if (/996/.test(digits) || /^0/.test(digits)) {
-      return raw.replace(/\s+/g, " ");
-    }
-    if (!candidate) {
-      candidate = raw.replace(/\s+/g, " ");
-    }
+    if (digits.length < 9 || digits.length > 12) continue;
+
+    const isKgMobile =
+      (digits.length === 12 && digits.startsWith("9967")) ||
+      (digits.length === 10 && digits.startsWith("0"));
+
+    if (!isKgMobile) continue;
+
+    const normalized = raw.replace(/\s+/g, " ").trim();
+    return normalized;
   }
-  return candidate;
+
+  return null;
 }
 
 function enrichLocation(
@@ -329,8 +340,12 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const location = enrichLocation(rawLocation, description);
     const images = parseImages(html);
     const ownerName = parseOwnerName(html);
+
+    // 1) пробуем вытащить телефон из всей HTML-страницы (как на скрине с кнопкой)
+    // 2) fallback — из текста описания
     const phone =
-      description ? parsePhoneFromText(description) : null;
+      parsePhoneFromText(html) ||
+      (description ? parsePhoneFromText(description) : null);
 
     return {
       id,
