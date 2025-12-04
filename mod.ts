@@ -21,11 +21,11 @@ const MIN_ROOMS = 1;
 const MAX_ROOMS = 2;
 const OWNER_ONLY = true;
 
-// лимит объявлений за один прогон — увеличен до 120
-const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "120");
+// лимит объявлений за один прогон — нормальный уровень
+const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "60");
 
-// сколько страниц списка обходим — увеличено до 20
-const PAGES = Number(Deno.env.get("PAGES") ?? "20");
+// сколько страниц списка обходим — тоже в пределах нормы
+const PAGES = Number(Deno.env.get("PAGES") ?? "10");
 
 const BASE_URL = "https://lalafo.kg";
 
@@ -64,6 +64,12 @@ async function fetchHtml(url: string): Promise<string> {
 
   if (res.status === 404) {
     console.log("Ad not found (404), skip:", url);
+    return "";
+  }
+
+  if (res.status === 403) {
+    console.log("Got 403 from Lalafo, skip:", url);
+    // возвращаем пустую строку, чтобы просто пропустить страницу/объявление
     return "";
   }
 
@@ -366,7 +372,6 @@ function genericAreaFromDescription(description: string | null): string | null {
  *   любые "Телефон: 71668825" и т.п. игнорируются.
  */
 function parsePhoneFromText(text: string): string | null {
-  // Явный формат "Телефон: ..."
   const explicit = text.match(/Телефон[:\s]*([0-9+()\-\s]{7,20})/i);
   if (explicit && explicit[1]) {
     const candidate = explicit[1].trim();
@@ -376,7 +381,6 @@ function parsePhoneFromText(text: string): string | null {
     }
   }
 
-  // Общий поиск по +996...
   const kgPattern = /(\+996[\s\-]?\d{2,3}[\s\-]?\d{3}[\s\-]?\d{3,4})/g;
 
   let match: RegExpExecArray | null;
@@ -548,8 +552,15 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
   const path =
     `/${CITY_SLUG}/kvartiry/arenda-kvartir/dolgosrochnaya-arenda-kvartir?page=${page}`;
   const html = await fetchHtml(new URL(path, BASE_URL).toString());
+
+  if (!html) {
+    // 403/404/другая ошибка уже залогирована в fetchHtml
+    return [];
+  }
+
   const links = extractListingLinks(html, CITY_SLUG);
   const ads: Ad[] = [];
+
   for (const link of links) {
     const ad = await fetchAd(link);
     if (!ad) continue;
@@ -561,6 +572,7 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
 
     ads.push(ad);
   }
+
   return ads;
 }
 
@@ -572,7 +584,8 @@ async function fetchAds(): Promise<Ad[]> {
       out.push(ad);
       if (out.length >= ADS_LIMIT) return out;
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    // Чуть больше пауза между страницами, чтобы не душили
+    await new Promise((r) => setTimeout(r, 1500));
   }
   return out;
 }
