@@ -294,20 +294,33 @@ function extractDistrictFromText(text: string): string | null {
 
   // убираем хвосты, которые могут идти в той же строке
   line = line.replace(/\bСерия:.*$/i, "");
+  line = line.replace(/\bКоммуникац.*$/i, "");
   line = line.replace(/\bЭтаж:.*$/i, "");
   line = line.replace(/\bКоличество комнат:.*$/i, "");
 
   return normalizeAreaName(line);
 }
 
-/** Строка вида "Бишкек, Арча-Бешик ж/м" */
+/** Строка вида "Бишкек, Асанбай мкр Серия: 105 серия ..." или "Бишкек, Джал мкр (в т.ч...." */
 function extractCityLineArea(text: string): string | null {
-  // берём первую строку/фрагмент, где есть "Бишкек," и дальше до конца строки или запятой
-  const m = text.match(/Бишкек[,，]\s*([^\n\r,]{2,80})/i);
-  if (m && m[1]) {
-    return normalizeAreaName(m[1]);
+  const m = text.match(/Бишкек[,，]\s*([^\n\r]{2,80})/i);
+  if (!m || !m[1]) return null;
+
+  let line = m[1];
+
+  // отрезаем всё после "Серия:", "Коммуникац", "Этаж:", "Количество комнат:"
+  line = line.replace(/\bСерия:.*$/i, "");
+  line = line.replace(/\bКоммуникац.*$/i, "");
+  line = line.replace(/\bЭтаж:.*$/i, "");
+  line = line.replace(/\bКоличество комнат:.*$/i, "");
+
+  // если есть скобки с пояснениями типа "(в т.ч. Верхний...)" — берём только до скобки
+  const idxParen = line.indexOf("(");
+  if (idxParen > 0) {
+    line = line.slice(0, idxParen);
   }
-  return null;
+
+  return normalizeAreaName(line);
 }
 
 /** общие шаблоны районов внутри описания */
@@ -379,7 +392,7 @@ function determineLocation(
   const district = extractDistrictFromText(plainText);
   if (district) return `Бишкек, ${district}`;
 
-  // 2) строка "Бишкек, Арча-Бешик ж/м" и т.п.
+  // 2) строка "Бишкек, Асанбай мкр ..." и т.п.
   const cityLine = extractCityLineArea(plainText);
   if (cityLine) return `Бишкек, ${cityLine}`;
 
