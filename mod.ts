@@ -283,6 +283,15 @@ function randomArea(): string {
   return RANDOM_AREAS[i];
 }
 
+/** редкий рандомный район, чаще просто "Бишкек" */
+function fallbackCityOrRandom(): string {
+  const r = Math.random();
+  if (r < 0.8) {
+    return "Бишкек";
+  }
+  return `Бишкек, ${randomArea()}`;
+}
+
 /**
  * Достаём район из текста по словарю AREA_PATTERNS.
  */
@@ -290,6 +299,20 @@ function detectAreaByDictionary(text: string | null): string | null {
   if (!text) return null;
   for (const { name, re } of AREA_PATTERNS) {
     if (re.test(text)) return name;
+  }
+  return null;
+}
+
+/**
+ * Из плейн-текста страницы достаём строку вида:
+ * "Район Бишкека: Аламединский рынок / базар"
+ */
+function extractDistrictFromText(text: string): string | null {
+  const m = text.match(/Район\s+Бишкека:\s*([^\n\r]+)/i);
+  if (m && m[1]) {
+    let val = m[1].trim();
+    val = val.replace(/\s+/g, " ");
+    return val;
   }
   return null;
 }
@@ -331,13 +354,18 @@ function phoneDigitsValid(phone: string | null): boolean {
   );
 }
 
+/**
+ * Логика района:
+ *  1) словарь (Моссовет, ЦУМ, 5 мкр и т.д.)
+ *  2) общие шаблоны "X мкр", "ЖК ...", "район ..."
+ *  3) если ничего — чаще "Бишкек", иногда "Бишкек, <рандом>"
+ */
 function enrichLocation(
   rawLocation: string | null,
   description: string | null,
 ): string {
   const textForArea = `${rawLocation ?? ""} ${description ?? ""}`;
 
-  // 1) сперва пытаемся найти район по словарю (Моссовет, ЦУМ, мкр, Ош и т.д.)
   const dictArea = detectAreaByDictionary(textForArea);
   if (dictArea) {
     return `Бишкек, ${dictArea}`;
@@ -345,7 +373,6 @@ function enrichLocation(
 
   let loc = rawLocation || "";
 
-  // 2) общие шаблоны: "5 мкр", "ЖК ...", "район ..."
   if ((!loc || loc.toLowerCase() === "бишкек") && description) {
     const mNumMkr = description.match(/(\d+\s*мкр)/i);
     if (mNumMkr && mNumMkr[1]) {
@@ -381,9 +408,8 @@ function enrichLocation(
     }
   }
 
-  // 3) если ничего не нашли — случайный район
   if (!loc || loc.toLowerCase() === "бишкек") {
-    return `Бишкек, ${randomArea()}`;
+    return fallbackCityOrRandom();
   }
 
   if (!loc.toLowerCase().includes("бишкек")) {
@@ -391,7 +417,7 @@ function enrichLocation(
   }
 
   if (!/,/.test(loc)) {
-    return `Бишкек, ${randomArea()}`;
+    return fallbackCityOrRandom();
   }
 
   return loc;
@@ -404,6 +430,8 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const html = await fetchHtml(url);
     if (!html) return null;
 
+    const plainText = stripTags(html); // для "Район Бишкека: ..."
+
     const id =
       extractFirst(/-id-(\d+)/, url) ??
       new URL(url).pathname.split("/").pop() ??
@@ -415,12 +443,18 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const created = parseCreated(html);
     const rawLocation = parseLocationFromJson(html) ?? parseLocationFallback(html);
     const description = parseDescription(html);
-    const location = enrichLocation(rawLocation, description);
+    const districtFromDetails = extractDistrictFromText(plainText);
+
+    const location = districtFromDetails
+      ? `Бишкек, ${districtFromDetails}`
+      : enrichLocation(rawLocation, description);
+
     const images = parseImages(html);
     const ownerName = parseOwnerName(html);
 
     const phone =
       parsePhoneFromText(html) ||
+      parsePhoneFromText(plainText) ||
       (description ? parsePhoneFromText(description) : null);
 
     return {
@@ -601,7 +635,7 @@ async function tgSend(
 }
 
 function buildCaption(ad: Ad): string {
-  const locStr = ad.location || `Бишкек, ${randomArea()}`;
+  const locStr = ad.location || fallbackCityOrRandom();
   const priceStr = ad.price_kgs != null
     ? `${ad.price_kgs.toLocaleString("ru-RU")} KGS`
     : "Цена не указана";
