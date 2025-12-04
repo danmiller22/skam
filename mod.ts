@@ -276,6 +276,38 @@ function normalizeAreaName(area: string): string {
   return a;
 }
 
+/** обрубает хвосты после служебных слов и скобок */
+function cutGarbageTail(input: string): string {
+  let s = input;
+
+  const stopPatterns: RegExp[] = [
+    /Серия:/i,
+    /Коммуникац/i,
+    /Этаж:/i,
+    /Количество комнат:/i,
+    /Тип предложения:/i,
+    /Услуги риэлтора/i,
+  ];
+
+  let cutIndex = s.length;
+
+  for (const re of stopPatterns) {
+    const m = s.match(re);
+    if (m && typeof m.index === "number" && m.index < cutIndex) {
+      cutIndex = m.index;
+    }
+  }
+
+  // скобки "(в т.ч. Верхний ...)"
+  const idxParen = s.indexOf("(");
+  if (idxParen >= 0 && idxParen < cutIndex) {
+    cutIndex = idxParen;
+  }
+
+  s = s.slice(0, cutIndex);
+  return s;
+}
+
 /** словарь районов (Моссовет, 5 мкр и т.п.) */
 function detectAreaByDictionary(text: string | null): string | null {
   if (!text) return null;
@@ -290,36 +322,16 @@ function extractDistrictFromText(text: string): string | null {
   const m = text.match(/Район\s+Бишкека:\s*([^\n\r]+)/i);
   if (!m || !m[1]) return null;
 
-  let line = m[1];
-
-  // убираем хвосты, без \b (из-за кириллицы \b не срабатывал)
-  line = line.replace(/Серия:.*$/i, "");
-  line = line.replace(/Коммуникац.*$/i, "");
-  line = line.replace(/Этаж:.*$/i, "");
-  line = line.replace(/Количество комнат:.*$/i, "");
-
+  let line = cutGarbageTail(m[1]);
   return normalizeAreaName(line);
 }
 
-/** Строка вида "Бишкек, Асанбай мкр Серия: 105 серия ..." или "Бишкек, Джал мкр (в т.ч...." */
+/** Строка вида "Бишкек, Ак-Ордо 1 ж/м Коммуникации: ..." */
 function extractCityLineArea(text: string): string | null {
   const m = text.match(/Бишкек[,，]\s*([^\n\r]{2,80})/i);
   if (!m || !m[1]) return null;
 
-  let line = m[1];
-
-  // отрезаем всё после служебных слов
-  line = line.replace(/Серия:.*$/i, "");
-  line = line.replace(/Коммуникац.*$/i, "");
-  line = line.replace(/Этаж:.*$/i, "");
-  line = line.replace(/Количество комнат:.*$/i, "");
-
-  // убираем скобочные хвосты "(в т.ч...."
-  const idxParen = line.indexOf("(");
-  if (idxParen > 0) {
-    line = line.slice(0, idxParen);
-  }
-
+  let line = cutGarbageTail(m[1]);
   return normalizeAreaName(line);
 }
 
@@ -392,7 +404,7 @@ function determineLocation(
   const district = extractDistrictFromText(plainText);
   if (district) return `Бишкек, ${district}`;
 
-  // 2) строка "Бишкек, Асанбай мкр ..." и т.п.
+  // 2) строка "Бишкек, Ак-Ордо 1 ж/м ..." и т.п.
   const cityLine = extractCityLineArea(plainText);
   if (cityLine) return `Бишкек, ${cityLine}`;
 
@@ -408,6 +420,30 @@ function determineLocation(
 
   // 5) вообще ничего не нашли
   return fallbackCityOrRandom();
+}
+
+/** финальная защита – чистим уже готовую строку location */
+function sanitizeLocation(loc: string | null): string {
+  if (!loc) return fallbackCityOrRandom();
+
+  let s = loc.trim();
+
+  // если просто "Бишкек" — оставляем
+  if (/^Бишкек\s*$/i.test(s)) return "Бишкек";
+
+  // если строка вида "Бишкек, ...", ещё раз обрежем хвосты
+  const m = s.match(/^Бишкек[,，]?\s*(.*)$/i);
+  if (m) {
+    const tail = cutGarbageTail(m[1] ?? "");
+    const area = normalizeAreaName(tail);
+    if (!area) return "Бишкек";
+    return `Бишкек, ${area}`;
+  }
+
+  // иначе просто убираем хвосты и ограничиваем длину
+  s = cutGarbageTail(s);
+  if (s.length > 60) s = s.slice(0, 60);
+  return s || "Бишкек";
 }
 
 /* ================= ОДНО ОБЪЯВЛЕНИЕ ================= */
@@ -429,7 +465,8 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const isOwner = parseIsOwner(html);
     const created = parseCreated(html);
     const description = parseDescription(html);
-    const location = determineLocation(plainText, description);
+    const rawLocation = determineLocation(plainText, description);
+    const location = sanitizeLocation(rawLocation);
     const images = parseImages(html);
     const ownerName = parseOwnerName(html);
 
@@ -547,7 +584,7 @@ async function fetchAds(): Promise<Ad[]> {
 
 /* ================= KV ================= */
 
-async function hasSeen(id: string): boolean {
+async function hasSeen(id: string): Promise<boolean> {
   const res = await kv.get(["seen_v3", id]);
   return Boolean(res.value);
 }
@@ -614,7 +651,7 @@ async function tgSend(
 
 /** caption с лимитом длины, чтобы не было "Text is too long" */
 function buildCaption(ad: Ad): string {
-  const locStr = ad.location || fallbackCityOrRandom();
+  const locStr = sanitizeLocation(ad.location);
   const priceStr = ad.price_kgs != null
     ? `${ad.price_kgs.toLocaleString("ru-RU")} KGS`
     : "Цена не указана";
