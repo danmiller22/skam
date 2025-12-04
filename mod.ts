@@ -21,11 +21,11 @@ const MIN_ROOMS = 1;
 const MAX_ROOMS = 2;
 const OWNER_ONLY = true;
 
-// лимит объявлений за один прогон — нормальный уровень
-const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "60");
+// очень аккуратный лимит объявлений за один прогон
+const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "30");
 
-// сколько страниц списка обходим — тоже в пределах нормы
-const PAGES = Number(Deno.env.get("PAGES") ?? "10");
+// очень аккуратное число страниц списка
+const PAGES = Number(Deno.env.get("PAGES") ?? "3");
 
 const BASE_URL = "https://lalafo.kg";
 
@@ -57,8 +57,13 @@ async function fetchHtml(url: string): Promise<string> {
   const res = await fetch(url, {
     headers: {
       "User-Agent":
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+        // обычный браузерный UA
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36",
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
       "Accept-Language": "ru,en;q=0.8",
+      "Connection": "keep-alive",
+      "Referer": BASE_URL + "/",
     },
   });
 
@@ -69,7 +74,6 @@ async function fetchHtml(url: string): Promise<string> {
 
   if (res.status === 403) {
     console.log("Got 403 from Lalafo, skip:", url);
-    // возвращаем пустую строку, чтобы просто пропустить страницу/объявление
     return "";
   }
 
@@ -554,7 +558,6 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
   const html = await fetchHtml(new URL(path, BASE_URL).toString());
 
   if (!html) {
-    // 403/404/другая ошибка уже залогирована в fetchHtml
     return [];
   }
 
@@ -584,8 +587,8 @@ async function fetchAds(): Promise<Ad[]> {
       out.push(ad);
       if (out.length >= ADS_LIMIT) return out;
     }
-    // Чуть больше пауза между страницами, чтобы не душили
-    await new Promise((r) => setTimeout(r, 1500));
+    // долгие паузы между страницами
+    await new Promise((r) => setTimeout(r, 5000));
   }
   return out;
 }
@@ -745,7 +748,8 @@ async function runOnce(): Promise<void> {
 
 /* ================= CRON + HTTP ================= */
 
-Deno.cron("lalafo-bishkek-rent", "*/5 * * * *", async () => {
+// очень редкий крон, чтобы не раздражать Lalafo
+Deno.cron("lalafo-bishkek-rent", "*/30 * * * *", async () => {
   try {
     await runOnce();
   } catch (e) {
