@@ -285,13 +285,19 @@ function detectAreaByDictionary(text: string | null): string | null {
   return null;
 }
 
-/** "Район Бишкека: Аламединский рынок / базар" */
+/** "Район Бишкека: Аламединский рынок / базар Серия: ..." */
 function extractDistrictFromText(text: string): string | null {
   const m = text.match(/Район\s+Бишкека:\s*([^\n\r]+)/i);
-  if (m && m[1]) {
-    return normalizeAreaName(m[1]);
-  }
-  return null;
+  if (!m || !m[1]) return null;
+
+  let line = m[1];
+
+  // убираем хвосты, которые могут идти в той же строке
+  line = line.replace(/\bСерия:.*$/i, "");
+  line = line.replace(/\bЭтаж:.*$/i, "");
+  line = line.replace(/\bКоличество комнат:.*$/i, "");
+
+  return normalizeAreaName(line);
 }
 
 /** Строка вида "Бишкек, Арча-Бешик ж/м" */
