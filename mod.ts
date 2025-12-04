@@ -6,7 +6,7 @@
  *  - 1–2 комнаты
  *  - цена ≤ 50 000 KGS
  *  - только собственники
- *  - обязательно есть номер телефона
+ *  - обязательно есть номер телефона (начинается с 996)
  */
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
@@ -21,11 +21,11 @@ const MIN_ROOMS = 1;
 const MAX_ROOMS = 2;
 const OWNER_ONLY = true;
 
-// лимит объявлений за один прогон
-const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "25");
+// лимит объявлений за один прогон — увеличен до 120
+const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "120");
 
-// сколько страниц списка обходим
-const PAGES = Number(Deno.env.get("PAGES") ?? "5");
+// сколько страниц списка обходим — увеличено до 20
+const PAGES = Number(Deno.env.get("PAGES") ?? "20");
 
 const BASE_URL = "https://lalafo.kg";
 
@@ -298,7 +298,6 @@ function cutGarbageTail(input: string): string {
     }
   }
 
-  // скобки "(в т.ч. Верхний ...)"
   const idxParen = s.indexOf("(");
   if (idxParen >= 0 && idxParen < cutIndex) {
     cutIndex = idxParen;
@@ -363,22 +362,28 @@ function genericAreaFromDescription(description: string | null): string | null {
 
 /**
  * Телефон:
- *   +996 7xx xxx xxx   или   0xx xxx xxx
+ *   только с кодом страны 996 (форматы вида +996 xxx xxx xxx и т.п.)
+ *   любые "Телефон: 71668825" и т.п. игнорируются.
  */
 function parsePhoneFromText(text: string): string | null {
-  const kgPattern =
-    /(\+996[\s\-]?\d{3}[\s\-]?\d{3}[\s\-]?\d{3})|(0\d{2}[\s\-]?\d{3}[\s\-]?\d{3})/g;
+  // Явный формат "Телефон: ..."
+  const explicit = text.match(/Телефон[:\s]*([0-9+()\-\s]{7,20})/i);
+  if (explicit && explicit[1]) {
+    const candidate = explicit[1].trim();
+    const digits = candidate.replace(/\D/g, "");
+    if (digits.startsWith("996") && digits.length >= 11 && digits.length <= 13) {
+      return candidate.replace(/\s+/g, " ");
+    }
+  }
+
+  // Общий поиск по +996...
+  const kgPattern = /(\+996[\s\-]?\d{2,3}[\s\-]?\d{3}[\s\-]?\d{3,4})/g;
 
   let match: RegExpExecArray | null;
   while ((match = kgPattern.exec(text)) !== null) {
     const raw = match[0];
     const digits = raw.replace(/\D/g, "");
-
-    if (digits.length === 12 && digits.startsWith("9967")) {
-      return raw.replace(/\s+/g, " ").trim();
-    }
-
-    if (digits.length === 10 && digits.startsWith("0")) {
+    if (digits.startsWith("996") && digits.length >= 11 && digits.length <= 13) {
       return raw.replace(/\s+/g, " ").trim();
     }
   }
@@ -386,13 +391,11 @@ function parsePhoneFromText(text: string): string | null {
   return null;
 }
 
+/** жёсткая проверка телефона — только 996... */
 function phoneDigitsValid(phone: string | null): boolean {
   if (!phone) return false;
   const digits = phone.replace(/\D/g, "");
-  return (
-    (digits.length === 10 && digits.startsWith("0")) ||
-    (digits.length === 12 && digits.startsWith("9967"))
-  );
+  return digits.startsWith("996") && digits.length >= 11 && digits.length <= 13;
 }
 
 /** вычисляем location только из районов */
@@ -400,25 +403,20 @@ function determineLocation(
   plainText: string,
   description: string | null,
 ): string {
-  // 1) явный "Район Бишкека: ..."
   const district = extractDistrictFromText(plainText);
   if (district) return `Бишкек, ${district}`;
 
-  // 2) строка "Бишкек, Ак-Ордо 1 ж/м ..." и т.п.
   const cityLine = extractCityLineArea(plainText);
   if (cityLine) return `Бишкек, ${cityLine}`;
 
-  // 3) словарь районов в полном тексте
   const dictArea = detectAreaByDictionary(
     plainText + " " + (description ?? ""),
   );
   if (dictArea) return `Бишкек, ${normalizeAreaName(dictArea)}`;
 
-  // 4) общие шаблоны по описанию
   const generic = genericAreaFromDescription(description);
   if (generic) return `Бишкек, ${generic}`;
 
-  // 5) вообще ничего не нашли
   return fallbackCityOrRandom();
 }
 
@@ -428,10 +426,8 @@ function sanitizeLocation(loc: string | null): string {
 
   let s = loc.trim();
 
-  // если просто "Бишкек" — оставляем
   if (/^Бишкек\s*$/i.test(s)) return "Бишкек";
 
-  // если строка вида "Бишкек, ...", ещё раз обрежем хвосты
   const m = s.match(/^Бишкек[,，]?\s*(.*)$/i);
   if (m) {
     const tail = cutGarbageTail(m[1] ?? "");
@@ -440,7 +436,6 @@ function sanitizeLocation(loc: string | null): string {
     return `Бишкек, ${area}`;
   }
 
-  // иначе просто убираем хвосты и ограничиваем длину
   s = cutGarbageTail(s);
   if (s.length > 60) s = s.slice(0, 60);
   return s || "Бишкек";
