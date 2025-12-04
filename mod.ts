@@ -64,7 +64,7 @@ async function fetchHtml(url: string): Promise<string> {
 
   if (res.status === 404) {
     console.log("Ad not found (404), skip:", url);
-    return ""; // вернём пустую строку, чтобы fetchAd вернул null
+    return "";
   }
 
   if (!res.ok) {
@@ -237,7 +237,7 @@ function parseOwnerName(html: string): string | null {
   return null;
 }
 
-/* ===== Телефон и район ===== */
+/* ===== Телефон и районы ===== */
 
 const RANDOM_AREAS = [
   "Моссовет",
@@ -256,9 +256,42 @@ const RANDOM_AREAS = [
   "12 мкр",
 ];
 
+type AreaPattern = { name: string; re: RegExp };
+
+const AREA_PATTERNS: AreaPattern[] = [
+  { name: "Моссовет", re: /\bмоссовет\b/i },
+  { name: "ЦУМ", re: /\bцу[мм]\b/i },
+  { name: "ГУМ", re: /\bгу[мм]\b/i },
+  { name: "Филармония", re: /\bфилармония\b/i },
+  {
+    name: "Молодая Гвардия",
+    re: /\bмолод(ая|ой)?\s+гварди[яи]\b/i,
+  },
+  { name: "Ош базар", re: /\bош\s*базар\b/i },
+  { name: "5 мкр", re: /\b5[\s\-]*мкр|5[\s\-]*микрорайон\b/i },
+  { name: "6 мкр", re: /\b6[\s\-]*мкр|6[\s\-]*микрорайон\b/i },
+  { name: "7 мкр", re: /\b7[\s\-]*мкр|7[\s\-]*микрорайон\b/i },
+  { name: "8 мкр", re: /\b8[\s\-]*мкр|8[\s\-]*микрорайон\b/i },
+  { name: "9 мкр", re: /\b9[\s\-]*мкр|9[\s\-]*микрорайон\b/i },
+  { name: "10 мкр", re: /\b10[\s\-]*мкр|10[\s\-]*микрорайон\b/i },
+  { name: "11 мкр", re: /\b11[\s\-]*мкр|11[\s\-]*микрорайон\b/i },
+  { name: "12 мкр", re: /\b12[\s\-]*мкр|12[\s\-]*микрорайон\b/i },
+];
+
 function randomArea(): string {
   const i = Math.floor(Math.random() * RANDOM_AREAS.length);
   return RANDOM_AREAS[i];
+}
+
+/**
+ * Достаём район из текста по словарю AREA_PATTERNS.
+ */
+function detectAreaByDictionary(text: string | null): string | null {
+  if (!text) return null;
+  for (const { name, re } of AREA_PATTERNS) {
+    if (re.test(text)) return name;
+  }
+  return null;
 }
 
 /**
@@ -277,12 +310,10 @@ function parsePhoneFromText(text: string): string | null {
     const raw = match[0];
     const digits = raw.replace(/\D/g, "");
 
-    // +996 XXX XXX XXX  -> 12 цифр, начинается с 9967
     if (digits.length === 12 && digits.startsWith("9967")) {
       return raw.replace(/\s+/g, " ").trim();
     }
 
-    // 0XX XXX XXX -> 10 цифр, начинается с 0
     if (digits.length === 10 && digits.startsWith("0")) {
       return raw.replace(/\s+/g, " ").trim();
     }
@@ -294,7 +325,6 @@ function parsePhoneFromText(text: string): string | null {
 function phoneDigitsValid(phone: string | null): boolean {
   if (!phone) return false;
   const digits = phone.replace(/\D/g, "");
-  // допускаем только 10 (0XX...) или 12 (+996 XXX...) цифр
   return (
     (digits.length === 10 && digits.startsWith("0")) ||
     (digits.length === 12 && digits.startsWith("9967"))
@@ -305,8 +335,17 @@ function enrichLocation(
   rawLocation: string | null,
   description: string | null,
 ): string {
+  const textForArea = `${rawLocation ?? ""} ${description ?? ""}`;
+
+  // 1) сперва пытаемся найти район по словарю (Моссовет, ЦУМ, мкр, Ош и т.д.)
+  const dictArea = detectAreaByDictionary(textForArea);
+  if (dictArea) {
+    return `Бишкек, ${dictArea}`;
+  }
+
   let loc = rawLocation || "";
 
+  // 2) общие шаблоны: "5 мкр", "ЖК ...", "район ..."
   if ((!loc || loc.toLowerCase() === "бишкек") && description) {
     const mNumMkr = description.match(/(\d+\s*мкр)/i);
     if (mNumMkr && mNumMkr[1]) {
@@ -342,7 +381,7 @@ function enrichLocation(
     }
   }
 
-  // если совсем ничего нормального не нашли — рандомный район
+  // 3) если ничего не нашли — случайный район
   if (!loc || loc.toLowerCase() === "бишкек") {
     return `Бишкек, ${randomArea()}`;
   }
@@ -363,7 +402,7 @@ function enrichLocation(
 async function fetchAd(url: string): Promise<Ad | null> {
   try {
     const html = await fetchHtml(url);
-    if (!html) return null; // 404 и подобные — пропускаем
+    if (!html) return null;
 
     const id =
       extractFirst(/-id-(\d+)/, url) ??
@@ -380,8 +419,6 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const images = parseImages(html);
     const ownerName = parseOwnerName(html);
 
-    // 1) пытаемся вытащить телефон из всей HTML-страницы
-    // 2) fallback — из описания
     const phone =
       parsePhoneFromText(html) ||
       (description ? parsePhoneFromText(description) : null);
@@ -470,16 +507,12 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
     const ad = await fetchAd(link);
     if (!ad) continue;
 
-    // 1–2 комнаты
     if (!isRoomsAllowed(ad)) continue;
 
-    // цена: обязательно и ≤ MAX_PRICE
     if (ad.price_kgs == null || ad.price_kgs > MAX_PRICE) continue;
 
-    // только собственники: отбрасываем только явные агентства/риэлторов
     if (OWNER_ONLY && ad.is_owner === false) continue;
 
-    // обязателен валидный номер телефона
     if (!phoneDigitsValid(ad.phone)) continue;
 
     ads.push(ad);
@@ -536,7 +569,6 @@ async function tgSend(
     return await fetch(url, { method: "POST", body: form });
   }
 
-  // максимум 2 попытки с учётом retry_after
   for (let attempt = 1; attempt <= 2; attempt++) {
     const res = await doRequest();
     const txt = await res.text();
@@ -549,7 +581,7 @@ async function tgSend(
           data.parameters?.retry_after ?? data.retry_after;
         if (typeof retry === "number" && retry > 0 && retry < 60) {
           await new Promise((r) => setTimeout(r, retry * 1000));
-          continue; // повторяем ту же отправку
+          continue;
         }
       } catch {
         // ignore
@@ -593,7 +625,6 @@ function buildCaption(ad: Ad): string {
     lines.push(`Объявление от: ${ad.created_raw}`);
   }
 
-  // без описания снизу
   return lines.join("\n");
 }
 
@@ -602,13 +633,12 @@ async function sendAd(ad: Ad): Promise<boolean> {
   const images = ad.images.slice(0, 10);
 
   if (!images.length) {
-    const ok = await tgSend("sendMessage", {
+    return await tgSend("sendMessage", {
       chat_id: CHAT_ID,
       text: caption,
       parse_mode: "HTML",
       disable_web_page_preview: true,
     });
-    return ok;
   }
 
   const media = images.map((url, idx) => {
@@ -623,11 +653,10 @@ async function sendAd(ad: Ad): Promise<boolean> {
     return obj;
   });
 
-  const ok = await tgSend("sendMediaGroup", {
+  return await tgSend("sendMediaGroup", {
     chat_id: CHAT_ID,
     media,
   });
-  return ok;
 }
 
 /* ================= ОДИН ПРОХОД ================= */
@@ -645,7 +674,6 @@ async function runOnce(): Promise<void> {
       await markSeen(ad.id);
     }
 
-    // пауза между объявлениями, чтобы меньше ловить 429
     await new Promise((r) => setTimeout(r, 2500));
   }
 }
