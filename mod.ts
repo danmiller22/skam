@@ -239,23 +239,23 @@ const RANDOM_AREAS = [
 type AreaPattern = { name: string; re: RegExp };
 
 const AREA_PATTERNS: AreaPattern[] = [
-  { name: "Моссовет", re: /\bмоссовет\b/i },
-  { name: "ЦУМ", re: /\bцу[мм]\b/i },
-  { name: "ГУМ", re: /\bгу[мм]\b/i },
-  { name: "Филармония", re: /\bфилармония\b/i },
+  { name: "Моссовет", re: /моссовет/i },
+  { name: "ЦУМ", re: /цу[мм]/i },
+  { name: "ГУМ", re: /гу[мм]/i },
+  { name: "Филармония", re: /филармония/i },
   {
     name: "Молодая Гвардия",
-    re: /\bмолод(ая|ой)?\s+гварди[яи]\b/i,
+    re: /молод(ая|ой)?\s+гварди[яи]/i,
   },
-  { name: "Ош базар", re: /\bош\s*базар\b/i },
-  { name: "5 мкр", re: /\b5[\s\-]*мкр|5[\s\-]*микрорайон\b/i },
-  { name: "6 мкр", re: /\b6[\s\-]*мкр|6[\s\-]*микрорайон\b/i },
-  { name: "7 мкр", re: /\b7[\s\-]*мкр|7[\s\-]*микрорайон\b/i },
-  { name: "8 мкр", re: /\b8[\s\-]*мкр|8[\s\-]*микрорайон\b/i },
-  { name: "9 мкр", re: /\b9[\s\-]*мкр|9[\s\-]*микрорайон\b/i },
-  { name: "10 мкр", re: /\b10[\s\-]*мкр|10[\s\-]*микрорайон\b/i },
-  { name: "11 мкр", re: /\b11[\s\-]*мкр|11[\s\-]*микрорайон\b/i },
-  { name: "12 мкр", re: /\b12[\s\-]*мкр|12[\s\-]*микрорайон\b/i },
+  { name: "Ош базар", re: /ош\s*базар/i },
+  { name: "5 мкр", re: /5[\s\-]*мкр|5[\s\-]*микрорайон/i },
+  { name: "6 мкр", re: /6[\s\-]*мкр|6[\s\-]*микрорайон/i },
+  { name: "7 мкр", re: /7[\s\-]*мкр|7[\s\-]*микрорайон/i },
+  { name: "8 мкр", re: /8[\s\-]*мкр|8[\s\-]*микрорайон/i },
+  { name: "9 мкр", re: /9[\s\-]*мкр|9[\s\-]*микрорайон/i },
+  { name: "10 мкр", re: /10[\s\-]*мкр|10[\s\-]*микрорайон/i },
+  { name: "11 мкр", re: /11[\s\-]*мкр|11[\s\-]*микрорайон/i },
+  { name: "12 мкр", re: /12[\s\-]*мкр|12[\s\-]*микрорайон/i },
 ];
 
 function randomArea(): string {
@@ -292,11 +292,11 @@ function extractDistrictFromText(text: string): string | null {
 
   let line = m[1];
 
-  // убираем хвосты, которые могут идти в той же строке
-  line = line.replace(/\bСерия:.*$/i, "");
-  line = line.replace(/\bКоммуникац.*$/i, "");
-  line = line.replace(/\bЭтаж:.*$/i, "");
-  line = line.replace(/\bКоличество комнат:.*$/i, "");
+  // убираем хвосты, без \b (из-за кириллицы \b не срабатывал)
+  line = line.replace(/Серия:.*$/i, "");
+  line = line.replace(/Коммуникац.*$/i, "");
+  line = line.replace(/Этаж:.*$/i, "");
+  line = line.replace(/Количество комнат:.*$/i, "");
 
   return normalizeAreaName(line);
 }
@@ -308,13 +308,13 @@ function extractCityLineArea(text: string): string | null {
 
   let line = m[1];
 
-  // отрезаем всё после "Серия:", "Коммуникац", "Этаж:", "Количество комнат:"
-  line = line.replace(/\bСерия:.*$/i, "");
-  line = line.replace(/\bКоммуникац.*$/i, "");
-  line = line.replace(/\bЭтаж:.*$/i, "");
-  line = line.replace(/\bКоличество комнат:.*$/i, "");
+  // отрезаем всё после служебных слов
+  line = line.replace(/Серия:.*$/i, "");
+  line = line.replace(/Коммуникац.*$/i, "");
+  line = line.replace(/Этаж:.*$/i, "");
+  line = line.replace(/Количество комнат:.*$/i, "");
 
-  // если есть скобки с пояснениями типа "(в т.ч. Верхний...)" — берём только до скобки
+  // убираем скобочные хвосты "(в т.ч...."
   const idxParen = line.indexOf("(");
   if (idxParen > 0) {
     line = line.slice(0, idxParen);
@@ -547,7 +547,7 @@ async function fetchAds(): Promise<Ad[]> {
 
 /* ================= KV ================= */
 
-async function hasSeen(id: string): Promise<boolean> {
+async function hasSeen(id: string): boolean {
   const res = await kv.get(["seen_v3", id]);
   return Boolean(res.value);
 }
