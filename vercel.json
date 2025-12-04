@@ -1,6 +1,6 @@
 {
   "functions": {
-    "api/run.ts": {
+    "api/run.js": {
       "runtime": "nodejs20.x",
       "maxDuration": 60
     }
