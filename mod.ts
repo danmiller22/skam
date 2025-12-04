@@ -22,10 +22,10 @@ const MAX_ROOMS = 2;
 const OWNER_ONLY = true;
 
 // лимит объявлений за один прогон
-const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "40");
+const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "25");
 
 // сколько страниц списка обходим
-const PAGES = Number(Deno.env.get("PAGES") ?? "6");
+const PAGES = Number(Deno.env.get("PAGES") ?? "5");
 
 const BASE_URL = "https://lalafo.kg";
 
@@ -61,9 +61,16 @@ async function fetchHtml(url: string): Promise<string> {
       "Accept-Language": "ru,en;q=0.8",
     },
   });
+
+  if (res.status === 404) {
+    console.log("Ad not found (404), skip:", url);
+    return ""; // вернём пустую строку, чтобы fetchAd вернул null
+  }
+
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} for ${url}`);
   }
+
   return await res.text();
 }
 
@@ -306,6 +313,8 @@ function enrichLocation(
 async function fetchAd(url: string): Promise<Ad | null> {
   try {
     const html = await fetchHtml(url);
+    if (!html) return null; // 404 и подобные — пропускаем
+
     const id =
       extractFirst(/-id-(\d+)/, url) ??
       new URL(url).pathname.split("/").pop() ??
@@ -458,39 +467,51 @@ async function tgSend(
     console.log("TELEGRAM_BOT_TOKEN/CHAT_ID not set, skip send");
     return false;
   }
+
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
-  const form = new FormData();
-  for (const [k, v] of Object.entries(payload)) {
-    if (k === "media") {
-      form.append(k, JSON.stringify(v));
-    } else {
-      form.append(k, String(v));
-    }
-  }
-  const res = await fetch(url, { method: "POST", body: form });
-  const txt = await res.text();
 
-  if (res.status === 429) {
-    console.log("Telegram error 429", txt);
-    try {
-      const data = JSON.parse(txt);
-      const retry =
-        data.parameters?.retry_after ?? data.retry_after;
-      if (typeof retry === "number" && retry > 0 && retry < 60) {
-        await new Promise((r) => setTimeout(r, retry * 1000));
+  async function doRequest(): Promise<Response> {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(payload)) {
+      if (k === "media") {
+        form.append(k, JSON.stringify(v));
+      } else {
+        form.append(k, String(v));
       }
-    } catch {
-      // ignore
     }
-    return false;
+    return await fetch(url, { method: "POST", body: form });
   }
 
-  if (!res.ok) {
-    console.log("Telegram error", res.status, txt);
-    return false;
+  // максимум 2 попытки с учётом retry_after
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const res = await doRequest();
+    const txt = await res.text();
+
+    if (res.status === 429) {
+      console.log("Telegram error 429", txt);
+      try {
+        const data = JSON.parse(txt);
+        const retry =
+          data.parameters?.retry_after ?? data.retry_after;
+        if (typeof retry === "number" && retry > 0 && retry < 60) {
+          await new Promise((r) => setTimeout(r, retry * 1000));
+          continue; // повторяем ту же отправку
+        }
+      } catch {
+        // ignore
+      }
+      return false;
+    }
+
+    if (!res.ok) {
+      console.log("Telegram error", res.status, txt);
+      return false;
+    }
+
+    return true;
   }
 
-  return true;
+  return false;
 }
 
 function buildCaption(ad: Ad): string {
@@ -570,7 +591,8 @@ async function runOnce(): Promise<void> {
       await markSeen(ad.id);
     }
 
-    await new Promise((r) => setTimeout(r, 1500));
+    // пауза между объявлениями, чтобы меньше ловить 429
+    await new Promise((r) => setTimeout(r, 2500));
   }
 }
 
