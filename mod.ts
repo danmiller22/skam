@@ -5,7 +5,7 @@
  *  - город: только Бишкек
  *  - 1–2 комнаты
  *  - цена ≤ 50 000 KGS
- *  - только собственники (отсекаем явные агентства/риэлторов)
+ *  - только собственники
  *  - обязательно есть номер телефона
  */
 
@@ -46,7 +46,7 @@ export interface Ad {
 
 const kv = await Deno.openKv();
 
-/* ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ================= */
+/* ================= ВСПОМОГАТЕЛЬНЫЕ ================= */
 
 function extractFirst(re: RegExp, text: string): string | null {
   const m = text.match(re);
@@ -146,26 +146,6 @@ function parseTitle(html: string): string | null {
   if (h1) return stripTags(h1);
   const t = extractFirst(/<title[^>]*>([\s\S]*?)<\/title>/i, html);
   return t ? stripTags(t) : null;
-}
-
-function parseLocationFromJson(html: string): string | null {
-  const mCity = html.match(/"addressLocality"\s*:\s*"([^"]+)"/);
-  const mStreet = html.match(/"streetAddress"\s*:\s*"([^"]+)"/);
-  if (mCity || mStreet) {
-    const parts = [mCity?.[1], mStreet?.[1]].filter(Boolean) as string[];
-    const combined = parts.join(", ");
-    if (combined) return combined;
-  }
-  return null;
-}
-
-function parseLocationFallback(html: string): string | null {
-  const re =
-    /\d{2}\.\d{2}\.\d{4}\s*\/\s*\d{2}:\d{2}\s*([\s\S]+?)\s*Позвонить/i;
-  const m = html.match(re);
-  if (!m) return null;
-  const loc = m[1].replace(/\s+/g, " ").trim();
-  return loc || null;
 }
 
 function cleanDescription(raw: string): string {
@@ -283,18 +263,20 @@ function randomArea(): string {
   return RANDOM_AREAS[i];
 }
 
-/** редкий рандомный район, чаще просто "Бишкек" */
+/** чаще просто Бишкек, очень редко Бишкек + рандомный район */
 function fallbackCityOrRandom(): string {
   const r = Math.random();
-  if (r < 0.8) {
-    return "Бишкек";
-  }
+  if (r < 0.95) return "Бишкек";
   return `Бишкек, ${randomArea()}`;
 }
 
-/**
- * Достаём район из текста по словарю AREA_PATTERNS.
- */
+function normalizeAreaName(area: string): string {
+  let a = area.trim().replace(/\s+/g, " ");
+  if (a.length > 40) a = a.slice(0, 40);
+  return a;
+}
+
+/** словарь районов (Моссовет, 5 мкр и т.п.) */
 function detectAreaByDictionary(text: string | null): string | null {
   if (!text) return null;
   for (const { name, re } of AREA_PATTERNS) {
@@ -303,26 +285,54 @@ function detectAreaByDictionary(text: string | null): string | null {
   return null;
 }
 
-/**
- * Из плейн-текста страницы достаём строку вида:
- * "Район Бишкека: Аламединский рынок / базар"
- */
+/** "Район Бишкека: Аламединский рынок / базар" */
 function extractDistrictFromText(text: string): string | null {
   const m = text.match(/Район\s+Бишкека:\s*([^\n\r]+)/i);
   if (m && m[1]) {
-    let val = m[1].trim();
-    val = val.replace(/\s+/g, " ");
-    return val;
+    return normalizeAreaName(m[1]);
   }
   return null;
 }
 
+/** Строка вида "Бишкек, Арча-Бешик ж/м" */
+function extractCityLineArea(text: string): string | null {
+  // берём первую строку/фрагмент, где есть "Бишкек," и дальше до конца строки или запятой
+  const m = text.match(/Бишкек[,，]\s*([^\n\r,]{2,80})/i);
+  if (m && m[1]) {
+    return normalizeAreaName(m[1]);
+  }
+  return null;
+}
+
+/** общие шаблоны районов внутри описания */
+function genericAreaFromDescription(description: string | null): string | null {
+  if (!description) return null;
+
+  let m = description.match(/(\d+\s*мкр)/i);
+  if (m && m[1]) return normalizeAreaName(m[1]);
+
+  m = description.match(/ЖК\s+([А-ЯЁA-Z0-9][^,.\n]+)/i);
+  if (m && m[1]) return normalizeAreaName("ЖК " + m[1]);
+
+  m = description.match(/([А-ЯЁA-Z][^,\n]{0,30}\s+мкр)/i);
+  if (m && m[1]) return normalizeAreaName(m[1]);
+
+  const patterns: RegExp[] = [
+    /микрорайон\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
+    /район\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
+    /Рабочий\s+Городок/i,
+  ];
+  for (const re of patterns) {
+    m = description.match(re);
+    if (m && m[0]) return normalizeAreaName(m[0]);
+  }
+
+  return null;
+}
+
 /**
- * Парсим телефон:
- *  - ищем только форматы:
- *      +996 XXX XXX XXX
- *      0XX XXX XXX
- *  - короткие ID (8 цифр и т.п.) вообще не проходят.
+ * Телефон:
+ *   +996 7xx xxx xxx   или   0xx xxx xxx
  */
 function parsePhoneFromText(text: string): string | null {
   const kgPattern =
@@ -354,73 +364,31 @@ function phoneDigitsValid(phone: string | null): boolean {
   );
 }
 
-/**
- * Логика района:
- *  1) словарь (Моссовет, ЦУМ, 5 мкр и т.д.)
- *  2) общие шаблоны "X мкр", "ЖК ...", "район ..."
- *  3) если ничего — чаще "Бишкек", иногда "Бишкек, <рандом>"
- */
-function enrichLocation(
-  rawLocation: string | null,
+/** вычисляем location только из районов */
+function determineLocation(
+  plainText: string,
   description: string | null,
 ): string {
-  const textForArea = `${rawLocation ?? ""} ${description ?? ""}`;
+  // 1) явный "Район Бишкека: ..."
+  const district = extractDistrictFromText(plainText);
+  if (district) return `Бишкек, ${district}`;
 
-  const dictArea = detectAreaByDictionary(textForArea);
-  if (dictArea) {
-    return `Бишкек, ${dictArea}`;
-  }
+  // 2) строка "Бишкек, Арча-Бешик ж/м" и т.п.
+  const cityLine = extractCityLineArea(plainText);
+  if (cityLine) return `Бишкек, ${cityLine}`;
 
-  let loc = rawLocation || "";
+  // 3) словарь районов в полном тексте
+  const dictArea = detectAreaByDictionary(
+    plainText + " " + (description ?? ""),
+  );
+  if (dictArea) return `Бишкек, ${normalizeAreaName(dictArea)}`;
 
-  if ((!loc || loc.toLowerCase() === "бишкек") && description) {
-    const mNumMkr = description.match(/(\d+\s*мкр)/i);
-    if (mNumMkr && mNumMkr[1]) {
-      const area = mNumMkr[1].trim();
-      return `Бишкек, ${area}`;
-    }
+  // 4) общие шаблоны по описанию
+  const generic = genericAreaFromDescription(description);
+  if (generic) return `Бишкек, ${generic}`;
 
-    const mJk = description.match(/ЖК\s+([А-ЯЁA-Z0-9][^,.\n]+)/i);
-    if (mJk && mJk[1]) {
-      const area = `ЖК ${mJk[1].trim()}`;
-      return `Бишкек, ${area}`;
-    }
-
-    const mNameMkr = description.match(
-      /([А-ЯЁA-Z][^,\n]{0,30}\s+мкр)/i,
-    );
-    if (mNameMkr && mNameMkr[1]) {
-      const area = mNameMkr[1].trim();
-      return `Бишкек, ${area}`;
-    }
-
-    const patterns: RegExp[] = [
-      /микрорайон\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
-      /район\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
-      /Рабочий Городок/i,
-    ];
-    for (const re of patterns) {
-      const m = description.match(re);
-      if (m && m[0]) {
-        const area = m[0].trim();
-        return `Бишкек, ${area}`;
-      }
-    }
-  }
-
-  if (!loc || loc.toLowerCase() === "бишкек") {
-    return fallbackCityOrRandom();
-  }
-
-  if (!loc.toLowerCase().includes("бишкек")) {
-    return `Бишкек, ${loc}`;
-  }
-
-  if (!/,/.test(loc)) {
-    return fallbackCityOrRandom();
-  }
-
-  return loc;
+  // 5) вообще ничего не нашли
+  return fallbackCityOrRandom();
 }
 
 /* ================= ОДНО ОБЪЯВЛЕНИЕ ================= */
@@ -430,7 +398,7 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const html = await fetchHtml(url);
     if (!html) return null;
 
-    const plainText = stripTags(html); // для "Район Бишкека: ..."
+    const plainText = stripTags(html);
 
     const id =
       extractFirst(/-id-(\d+)/, url) ??
@@ -441,14 +409,8 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const rooms = parseRooms(html);
     const isOwner = parseIsOwner(html);
     const created = parseCreated(html);
-    const rawLocation = parseLocationFromJson(html) ?? parseLocationFallback(html);
     const description = parseDescription(html);
-    const districtFromDetails = extractDistrictFromText(plainText);
-
-    const location = districtFromDetails
-      ? `Бишкек, ${districtFromDetails}`
-      : enrichLocation(rawLocation, description);
-
+    const location = determineLocation(plainText, description);
     const images = parseImages(html);
     const ownerName = parseOwnerName(html);
 
@@ -493,7 +455,7 @@ function parseImages(html: string): string[] {
   return out;
 }
 
-/* ================= ЛОГИКА ФИЛЬТРОВ ================= */
+/* ================= ФИЛЬТРЫ ================= */
 
 function isRoomsAllowed(ad: Ad): boolean {
   if (ad.rooms != null) {
@@ -542,11 +504,8 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
     if (!ad) continue;
 
     if (!isRoomsAllowed(ad)) continue;
-
     if (ad.price_kgs == null || ad.price_kgs > MAX_PRICE) continue;
-
     if (OWNER_ONLY && ad.is_owner === false) continue;
-
     if (!phoneDigitsValid(ad.phone)) continue;
 
     ads.push(ad);
@@ -634,6 +593,7 @@ async function tgSend(
   return false;
 }
 
+/** caption с лимитом длины, чтобы не было "Text is too long" */
 function buildCaption(ad: Ad): string {
   const locStr = ad.location || fallbackCityOrRandom();
   const priceStr = ad.price_kgs != null
@@ -659,7 +619,14 @@ function buildCaption(ad: Ad): string {
     lines.push(`Объявление от: ${ad.created_raw}`);
   }
 
-  return lines.join("\n");
+  let caption = lines.join("\n");
+
+  const MAX_CAPTION_LEN = 900;
+  if (caption.length > MAX_CAPTION_LEN) {
+    caption = caption.slice(0, MAX_CAPTION_LEN - 1);
+  }
+
+  return caption;
 }
 
 async function sendAd(ad: Ad): Promise<boolean> {
