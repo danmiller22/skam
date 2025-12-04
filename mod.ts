@@ -1,18 +1,18 @@
 /**
  * Lalafo → Telegram бот под Deno Deploy.
  *
- * Скрейпит объявления о долгосрочной аренде квартир в Бишкеке
- * и отправляет новые объявления в Telegram.
+ * Пример формата сообщения:
  *
- * Пример формата:
+ * 5 мкр
  *
- * 🏠 Аренда две комнаты в Бишкеке
- * 💰 50 000 KGS
- * 📍 Бишкек, Тунгуч мкр
- * 🛏 Комнат: 2
- * 👤 Контакт: Baha
- * 📞 Телефон: +996 XXX XXX XXX
- * ℹ️ от собственника • 16.11.2025 / 16:28
+ * Количество комнат: 1
+ * Тип недвижимости: Квартира
+ * Тип предложения: Собственник
+ *
+ * Цена: 42000 KGS
+ * Контакт: Baha
+ * Телефон: +996 505 506 590
+ * Объявление от: 16.11.2025 / 16:28
  *
  * <описание объявления без ссылок и lalafo.kg>
  */
@@ -22,7 +22,7 @@ const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
 
 const CITY_SLUG = Deno.env.get("CITY_SLUG") ?? "bishkek";
 const PAGES = Number(Deno.env.get("PAGES") ?? "3");
-const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "100");
+const ADS_LIMIT = Number(Deno.env.get("ADS_LIMIT") ?? "30"); // чтобы не ловить 429
 
 const BASE_URL = "https://lalafo.kg";
 
@@ -144,35 +144,19 @@ function parseLocationFallback(html: string): string | null {
   return loc || null;
 }
 
-function parseLocation(html: string): string | null {
-  return parseLocationFromJson(html) ?? parseLocationFallback(html);
-}
-
-function parseImages(html: string): string[] {
-  const re = /https:\/\/img\d+\.lalafo\.com\/[^\s"'<>]+/g;
-  const seen = new Set<string>();
-  const out: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    const u = m[0];
-    if (!u.includes("/posters/")) continue;
-    if (seen.has(u)) continue;
-    seen.add(u);
-    out.push(u);
-    if (out.length >= 10) break;
-  }
-  return out;
-}
-
 function cleanDescription(raw: string): string {
   let s = raw;
 
   // убираем все ссылки
   s = s.replace(/https?:\/\/\S+/gi, "");
   s = s.replace(/lalafo\.kg/gi, "");
-
-  // убираем лишние квадратные скобки/мусор вида 【…】
   s = s.replace(/【[^】]*】/g, " ");
+  s = s.replace(/ᐈ/g, " ");
+
+  // режем строки, выбрасываем те, где есть lalafo
+  const parts = s.split(/[\r\n]+/);
+  const filtered = parts.filter((p) => !/lalafo/i.test(p));
+  s = filtered.join("\n");
 
   s = s.replace(/\s{2,}/g, " ").trim();
   return s;
@@ -232,9 +216,9 @@ function parseOwnerName(html: string): string | null {
 }
 
 function parsePhoneFromText(text: string): string | null {
-  // ищем что-то похожее на телефон (КР: +996 / 0XXX / 0550 и т.п.)
+  // ищем реальные телефоны: +996... или 0XXX XX XX XX
   const phoneRegex =
-    /(?:\+996[\s\-]?)?(?:0\d{2}|\d{3})[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2}/g;
+    /(\+996[\s\-]?\d[\d\s\-]{7,}|0\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})/g;
   const matches = text.match(phoneRegex);
   if (!matches) return null;
 
@@ -253,9 +237,24 @@ function enrichLocation(
 ): string {
   let loc = rawLocation || "";
 
-  if ((!loc || loc === "Бишкек") && description) {
+  if ((!loc || loc.toLowerCase() === "бишкек") && description) {
+    // 5 мкр / 7 мкр
+    const mNumMkr = description.match(/(\d+\s*мкр)/i);
+    if (mNumMkr && mNumMkr[1]) {
+      const area = mNumMkr[1].trim();
+      return `Бишкек, ${area}`;
+    }
+
+    // Название + мкр
+    const mNameMkr = description.match(
+      /([А-ЯЁA-Z][^,\n]{0,30}\s+мкр)/i,
+    );
+    if (mNameMkr && mNameMkr[1]) {
+      const area = mNameMkr[1].trim();
+      return `Бишкек, ${area}`;
+    }
+
     const patterns: RegExp[] = [
-      /([А-ЯЁA-Z][^,\n]{0,30}\s+(?:мкр|микрорайон|ж\/м))/i,
       /микрорайон\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
       /район\s+([А-ЯЁA-Z][^,\n]{0,30})/i,
     ];
@@ -275,7 +274,7 @@ function enrichLocation(
   return loc;
 }
 
-/* ============ ЗАГРУЗКА ОДНОГО ОБЪЯВЛЕНИЯ ============ */
+/* ============ ОДНО ОБЪЯВЛЕНИЕ ============ */
 
 async function fetchAd(url: string): Promise<Ad | null> {
   try {
@@ -289,7 +288,7 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const rooms = parseRooms(html);
     const isOwner = parseIsOwner(html);
     const created = parseCreated(html);
-    const rawLocation = parseLocation(html);
+    const rawLocation = parseLocationFromJson(html) ?? parseLocationFallback(html);
     const description = parseDescription(html);
     const location = enrichLocation(rawLocation, description);
     const images = parseImages(html);
@@ -317,7 +316,25 @@ async function fetchAd(url: string): Promise<Ad | null> {
   }
 }
 
-/* ============ ЗАГРУЗКА СПИСКА ОБЪЯВЛЕНИЙ ============ */
+/* картинки объявления */
+
+function parseImages(html: string): string[] {
+  const re = /https:\/\/img\d+\.lalafo\.com\/[^\s"'<>]+/g;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const u = m[0];
+    if (!u.includes("/posters/")) continue;
+    if (seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+/* ============ СПИСОК ОБЪЯВЛЕНИЙ ============ */
 
 async function fetchAdsPage(page: number): Promise<Ad[]> {
   const path =
@@ -388,48 +405,45 @@ async function tgSend(
   }
 }
 
-function roomsToWords(rooms: number | null): string {
-  if (rooms === 1) return "одна комната";
-  if (rooms === 2) return "две комнаты";
-  if (rooms && rooms > 2) return `${rooms} комнат`;
-  return "квартира";
-}
-
 function buildCaption(ad: Ad): string {
-  const roomsPhrase = roomsToWords(ad.rooms);
+  const locStr = ad.location || "Бишкек";
   const priceStr = ad.price_kgs != null
     ? `${ad.price_kgs.toLocaleString("ru-RU")} KGS`
     : "Цена не указана";
-  const locStr = ad.location || "Бишкек";
+  const roomsStr = ad.rooms != null ? String(ad.rooms) : "—";
 
-  const header = `🏠 <b>Аренда ${roomsPhrase} в Бишкеке</b>\n`;
-  const priceLine = `💰 <b>${priceStr}</b>\n`;
-  const locLine = `📍 ${locStr}\n`;
+  const lines: string[] = [];
 
-  const roomsLine =
-    ad.rooms != null ? `🛏 Комнат: ${ad.rooms}\n` : "";
+  lines.push(locStr);
+  lines.push("");
+  lines.push(`Количество комнат: ${roomsStr}`);
+  lines.push("Тип недвижимости: Квартира");
 
-  const contactLine = ad.owner_name
-    ? `👤 Контакт: ${ad.owner_name}\n`
-    : "";
-
-  const phoneLine = ad.phone
-    ? `📞 Телефон: ${ad.phone}\n`
-    : "";
-
-  const meta: string[] = [];
-  if (ad.is_owner === true) meta.push("от собственника");
-  else if (ad.is_owner === false) meta.push("от агентства/риэлтора");
-  if (ad.created_raw) meta.push(ad.created_raw);
-  const metaLine = meta.length ? `ℹ️ ${meta.join(" • ")}\n` : "";
-
-  let descPart = "";
-  if (ad.description) {
-    descPart = `\n${ad.description}`;
+  if (ad.is_owner === true) {
+    lines.push("Тип предложения: Собственник");
+  } else if (ad.is_owner === false) {
+    lines.push("Тип предложения: Агентство/риэлтор");
   }
 
-  return header + priceLine + locLine + roomsLine +
-    contactLine + phoneLine + metaLine + descPart;
+  lines.push("");
+  lines.push(`Цена: ${priceStr}`);
+
+  if (ad.owner_name) {
+    lines.push(`Контакт: ${ad.owner_name}`);
+  }
+  if (ad.phone) {
+    lines.push(`Телефон: ${ad.phone}`);
+  }
+  if (ad.created_raw) {
+    lines.push(`Объявление от: ${ad.created_raw}`);
+  }
+
+  if (ad.description) {
+    lines.push("");
+    lines.push(ad.description);
+  }
+
+  return lines.join("\n");
 }
 
 async function sendAd(ad: Ad): Promise<void> {
