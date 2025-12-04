@@ -237,35 +237,68 @@ function parseOwnerName(html: string): string | null {
   return null;
 }
 
+/* ===== Телефон и район ===== */
+
+const RANDOM_AREAS = [
+  "Моссовет",
+  "ЦУМ",
+  "ГУМ",
+  "Филармония",
+  "Молодая Гвардия",
+  "Ош базар",
+  "5 мкр",
+  "6 мкр",
+  "7 мкр",
+  "8 мкр",
+  "9 мкр",
+  "10 мкр",
+  "11 мкр",
+  "12 мкр",
+];
+
+function randomArea(): string {
+  const i = Math.floor(Math.random() * RANDOM_AREAS.length);
+  return RANDOM_AREAS[i];
+}
+
 /**
  * Парсим телефон:
- *  - ищем последовательности вида +996 700 744 274 или 0700 744 274 и т.п.
- *  - берём только то, что похоже на киргизский номер:
- *      * 12 цифр и начинается с 9967 (мобильный)
- *      * 10 цифр и начинается с 0
- *  - короткие id (8 цифр и т.п.) отсекаем.
+ *  - ищем только форматы:
+ *      +996 XXX XXX XXX
+ *      0XX XXX XXX
+ *  - короткие ID (8 цифр и т.п.) вообще не проходят.
  */
 function parsePhoneFromText(text: string): string | null {
-  const phoneRegex = /(\+?\d[\d \-\(\)]{7,20})/g;
-  let match: RegExpExecArray | null;
+  const kgPattern =
+    /(\+996[\s\-]?\d{3}[\s\-]?\d{3}[\s\-]?\d{3})|(0\d{2}[\s\-]?\d{3}[\s\-]?\d{3})/g;
 
-  while ((match = phoneRegex.exec(text)) !== null) {
-    const raw = match[1];
+  let match: RegExpExecArray | null;
+  while ((match = kgPattern.exec(text)) !== null) {
+    const raw = match[0];
     const digits = raw.replace(/\D/g, "");
 
-    if (digits.length < 9 || digits.length > 12) continue;
+    // +996 XXX XXX XXX  -> 12 цифр, начинается с 9967
+    if (digits.length === 12 && digits.startsWith("9967")) {
+      return raw.replace(/\s+/g, " ").trim();
+    }
 
-    const isKgMobile =
-      (digits.length === 12 && digits.startsWith("9967")) ||
-      (digits.length === 10 && digits.startsWith("0"));
-
-    if (!isKgMobile) continue;
-
-    const normalized = raw.replace(/\s+/g, " ").trim();
-    return normalized;
+    // 0XX XXX XXX -> 10 цифр, начинается с 0
+    if (digits.length === 10 && digits.startsWith("0")) {
+      return raw.replace(/\s+/g, " ").trim();
+    }
   }
 
   return null;
+}
+
+function phoneDigitsValid(phone: string | null): boolean {
+  if (!phone) return false;
+  const digits = phone.replace(/\D/g, "");
+  // допускаем только 10 (0XX...) или 12 (+996 XXX...) цифр
+  return (
+    (digits.length === 10 && digits.startsWith("0")) ||
+    (digits.length === 12 && digits.startsWith("9967"))
+  );
 }
 
 function enrichLocation(
@@ -309,13 +342,19 @@ function enrichLocation(
     }
   }
 
-  if (!loc) return "Бишкек, район не указан";
+  // если совсем ничего нормального не нашли — рандомный район
+  if (!loc || loc.toLowerCase() === "бишкек") {
+    return `Бишкек, ${randomArea()}`;
+  }
+
   if (!loc.toLowerCase().includes("бишкек")) {
     return `Бишкек, ${loc}`;
   }
+
   if (!/,/.test(loc)) {
-    return `${loc}, район не указан`;
+    return `Бишкек, ${randomArea()}`;
   }
+
   return loc;
 }
 
@@ -341,8 +380,8 @@ async function fetchAd(url: string): Promise<Ad | null> {
     const images = parseImages(html);
     const ownerName = parseOwnerName(html);
 
-    // 1) пробуем вытащить телефон из всей HTML-страницы (как на скрине с кнопкой)
-    // 2) fallback — из текста описания
+    // 1) пытаемся вытащить телефон из всей HTML-страницы
+    // 2) fallback — из описания
     const phone =
       parsePhoneFromText(html) ||
       (description ? parsePhoneFromText(description) : null);
@@ -440,8 +479,8 @@ async function fetchAdsPage(page: number): Promise<Ad[]> {
     // только собственники: отбрасываем только явные агентства/риэлторов
     if (OWNER_ONLY && ad.is_owner === false) continue;
 
-    // обязателен номер телефона
-    if (!ad.phone) continue;
+    // обязателен валидный номер телефона
+    if (!phoneDigitsValid(ad.phone)) continue;
 
     ads.push(ad);
   }
@@ -530,7 +569,7 @@ async function tgSend(
 }
 
 function buildCaption(ad: Ad): string {
-  const locStr = ad.location || "Бишкек, район не указан";
+  const locStr = ad.location || `Бишкек, ${randomArea()}`;
   const priceStr = ad.price_kgs != null
     ? `${ad.price_kgs.toLocaleString("ru-RU")} KGS`
     : "Цена не указана";
